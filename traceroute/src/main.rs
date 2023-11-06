@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{bail, Result};
 use pnet::packet::{
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
     ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
@@ -14,6 +14,7 @@ use raw_socket::{
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
     sync::Arc,
 };
 use structopt::StructOpt;
@@ -22,7 +23,7 @@ use tokio::{
         mpsc::{channel, Receiver, Sender},
         Mutex, Semaphore,
     },
-    time::{timeout, Duration, Instant},
+    time::{Duration, Instant},
 };
 
 const START_TTL: u8 = 0;
@@ -43,18 +44,18 @@ async fn main() {
     }
 }
 
-async fn run(target: &str, protocol: &str) -> anyhow::Result<()> {
+async fn run(target: &str, protocol: &str) -> Result<()> {
     let target_ip = to_ipaddr(target)?;
-    let protocol = TracerouteProtocol::from_str(protocol)?;
+    let protocol = protocol.parse::<TracerouteProtocol>()?;
 
     let semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_FLIGHT));
 
     /* Protected access to these variables that are shared across the tasks is needed
      * to synchronize them and prevent race conditions, by e.g. having two tasks updating
      * the TTL simultaneously. */
-    let ttl_mutex = Arc::new(Mutex::new(START_TTL));
-    let times_mutex = Arc::new(Mutex::new(HashMap::new()));
-    let probed_mutex = Arc::new(Mutex::new(HashSet::new()));
+    let ttl = Arc::new(Mutex::new(START_TTL));
+    let timetable = Arc::new(Mutex::new(HashMap::new()));
+    let already_inspected = Arc::new(Mutex::new(HashSet::new()));
 
     /* Memory channel for communicating between the printer and the receiver. */
     let (tx, rx) = channel(8192);
@@ -62,37 +63,35 @@ async fn run(target: &str, protocol: &str) -> anyhow::Result<()> {
     let printer = tokio::spawn(print_results(rx));
     let receiver = tokio::spawn(receive(
         Arc::clone(&semaphore),
-        Arc::clone(&times_mutex),
+        Arc::clone(&timetable),
         tx.clone(),
-        Arc::clone(&ttl_mutex),
-        Arc::clone(&probed_mutex),
+        Arc::clone(&already_inspected),
     ));
 
     let mut tasks = vec![];
 
-    for _ in 0..255 {
-        let target_ip = target_ip.clone();
+    for _ in 0..u8::MAX {
         let semaphore = Arc::clone(&semaphore);
-        let counter_mutex = Arc::clone(&ttl_mutex);
-        let times_mutex = Arc::clone(&times_mutex);
-        let probed_mutex = Arc::clone(&probed_mutex);
+        let counter = Arc::clone(&ttl);
+        let timetable = Arc::clone(&timetable);
+        let already_inspected = Arc::clone(&already_inspected);
 
         tasks.push(tokio::spawn(trace(
             target_ip,
             protocol,
             semaphore,
-            counter_mutex,
-            times_mutex,
-            probed_mutex,
+            counter,
+            timetable,
+            already_inspected,
         )));
     }
 
     for task in tasks {
-        let _ = task.await?;
+        task.await??;
     }
 
-    let _ = printer.await?;
-    let _ = receiver.await?;
+    printer.await?;
+    receiver.await??;
 
     Ok(())
 }
@@ -101,30 +100,30 @@ async fn trace(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
     semaphore: Arc<Semaphore>,
-    counter_mutex: Arc<Mutex<u8>>,
-    times_mutex: Arc<Mutex<HashMap<usize, Instant>>>,
-    probed_mutex: Arc<Mutex<HashSet<u8>>>,
-) -> anyhow::Result<()> {
+    ttl_mutex: Arc<Mutex<u8>>,
+    timetable: Arc<Mutex<HashMap<u8, Instant>>>,
+    already_inspected: Arc<Mutex<HashSet<u8>>>,
+) -> Result<()> {
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
      * We are limiting the number of tasks in flight so we don't end up
      * sending more packets than needed by spawning too many tasks. */
-    if let Ok(permit) = semaphore.clone().acquire().await {
+
+    if let Ok(permit) = semaphore.acquire().await {
         /* Each task increments the TTL and sends a probe. */
         let ttl = {
-            let mut counter = counter_mutex.lock().await;
+            let mut counter = ttl_mutex.lock().await;
             *counter += 1;
             *counter
         };
 
-        {
-            let mut probed = probed_mutex.lock().await;
-            probed.insert(ttl);    
-        }
+        send_probe(target, protocol, ttl, Arc::clone(&timetable)).await?;
 
-        send_probe(target, protocol, ttl, Arc::clone(&times_mutex)).await?;
-    
+        let mut already_inspected = already_inspected.lock().await;
+        already_inspected.insert(ttl);
+
         permit.forget();
     }
+
     Ok(())
 }
 
@@ -132,32 +131,28 @@ async fn send_probe(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
     ttl: u8,
-    times_mutex: Arc<Mutex<HashMap<usize, Instant>>>,
-) -> std::io::Result<()> {
+    timetable: Arc<Mutex<HashMap<u8, Instant>>>,
+) -> Result<()> {
     let sock = RawSocket::new(
         Domain::ipv4(),
         Type::raw(),
         Protocol::from(IPPROTO_RAW).into(),
     )?;
 
-    let ip_next_hdr_protocol = match protocol {
-        TracerouteProtocol::Udp => IpNextHeaderProtocols::Udp,
-        TracerouteProtocol::Icmp => IpNextHeaderProtocols::Icmp,
-    };
-
-    let ip_next_hdr_len = match protocol {
-        TracerouteProtocol::Udp => UDP_HDR_LEN,
-        TracerouteProtocol::Icmp => ICMP_HDR_LEN,
-    };
-
-    let mut ipv4_buf = match protocol {
-        TracerouteProtocol::Udp => vec![0u8; IP_HDR_LEN + UDP_HDR_LEN],
-        TracerouteProtocol::Icmp => vec![0u8; IP_HDR_LEN + ICMP_HDR_LEN],
-    };
-
-    let mut ip_next_hdr_buf = match protocol {
-        TracerouteProtocol::Udp => vec![0u8; UDP_HDR_LEN],
-        TracerouteProtocol::Icmp => vec![0u8; ICMP_HDR_LEN],
+    let (ip_next_hdr_protocol, ip_next_hdr_len, mut ipv4_buf, mut ip_next_hdr_buf) = match protocol
+    {
+        TracerouteProtocol::Udp => (
+            IpNextHeaderProtocols::Udp,
+            UDP_HDR_LEN,
+            vec![0u8; IP_HDR_LEN + UDP_HDR_LEN],
+            vec![0u8; UDP_HDR_LEN],
+        ),
+        TracerouteProtocol::Icmp => (
+            IpNextHeaderProtocols::Icmp,
+            ICMP_HDR_LEN,
+            vec![0u8; IP_HDR_LEN + ICMP_HDR_LEN],
+            vec![0u8; ICMP_HDR_LEN],
+        ),
     };
 
     let mut ipv4_packet = build_ipv4_packet(
@@ -167,6 +162,7 @@ async fn send_probe(
         ttl,
         ip_next_hdr_protocol,
     );
+
     let next_packet = match protocol {
         TracerouteProtocol::Udp => build_udp_packet(&mut ip_next_hdr_buf),
         TracerouteProtocol::Icmp => build_icmp_packet(&mut ip_next_hdr_buf),
@@ -177,131 +173,102 @@ async fn send_probe(
         NextPacket::Udp(packet) => ipv4_packet.set_payload(packet.packet()),
     };
 
-    sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &(1i32))?;
+    sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &1i32)?;
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
     sock.send_to(ipv4_packet.packet(), (target, 0)).await?;
 
-    let mut times = {
-        let guard = times_mutex.lock().await;
-        guard
-    };
-    times.insert(ttl.into(), Instant::now());
+    let mut timetable = timetable.lock().await;
+    timetable.insert(ttl, Instant::now());
 
     Ok(())
 }
 
 async fn receive(
     semaphore: Arc<Semaphore>,
-    times_mutex: Arc<Mutex<HashMap<usize, Instant>>>,
+    timetable: Arc<Mutex<HashMap<u8, Instant>>>,
     tx: Sender<Message>,
-    counter_mutex: Arc<Mutex<u8>>,
-    probed_mutex: Arc<Mutex<HashSet<u8>>>,
-) -> anyhow::Result<()> {
+    already_inspected: Arc<Mutex<HashSet<u8>>>,
+) -> Result<()> {
     let recv_sock = create_sock()?;
     let mut recv_buf = [0u8; 16536];
 
     let mut recvd = HashSet::new();
 
     loop {
-        let (_bytes_received, ip_addr) =
-        match timeout(Duration::from_secs(1), recv_sock.recv_from(&mut recv_buf)).await {
-            Ok(result) => result.unwrap(),
-            Err(_) => {
-                let ttl = {
-                    let guard = counter_mutex.lock().await;
-                    *guard
-                };
-                tx.send(Message::Timeout(ttl)).await?;
-                println!("sent timeout, returnin Err");
-                return Err(anyhow!("We timed out."));
-            }
-        };
+        let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
 
         let icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
             Some(packet) => packet,
-            None => return Err(anyhow!("Couldn't make an ICMP packet.")),
+            None => bail!("couldn't make icmp packet"),
         };
 
         let reverse_dns_task =
-            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.clone().ip()));
-        let hostname = match reverse_dns_task.await? {
-            Ok(host) => host,
-            Err(e) => return Err(anyhow!("Reverse DNS failed: {:?}", e)),
-        };
+            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.ip()));
+        let hostname = reverse_dns_task.await??;
 
-        let original_ipv4_packet =
-        match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..]) {
+        let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..]) {
             Some(packet) => packet,
-            None => return Err(anyhow!("Couldn't make an IPv4 packet.")),
+            None => bail!("couldn't make ivp4 packet"),
         };
-        let hop = original_ipv4_packet.get_identification();
+        let hop = original_ipv4_packet.get_identification() as u8;
 
-        recvd.insert(hop as u8);
+        recvd.insert(hop);
 
         match icmp_packet.get_icmp_type() {
             IcmpTypes::TimeExceeded => {
                 /* A part of the original IPv4 packet (header + at least first 8 bytes)
-                    * is contained in an ICMP error message. We use the identification field
-                    * to map responses back to correct hops. */
-   
-                let guard = times_mutex.lock().await;
+                 * is contained in an ICMP error message. We use the identification field
+                 * to map responses back to correct hops. */
 
-                let time_elapsed =
-                    Instant::now().duration_since(*guard.get(&(hop as usize)).unwrap());
+                let timetable = timetable.lock().await;
 
-                tx.send(Message::Ok((hop as u8, hostname, ip_addr, time_elapsed)))
+                let time_elapsed = match timetable.get(&hop) {
+                    Some(time) => Instant::now().duration_since(*time),
+                    None => bail!("did not found time {} in the timetable", hop),
+                };
+
+                tx.send(Message::Ok((hop, hostname, ip_addr, time_elapsed)))
                     .await?;
 
                 /* Allow one more task to go through. */
                 semaphore.add_permits(1);
             }
             IcmpTypes::EchoReply | IcmpTypes::DestinationUnreachable => {
-                let times = {
-                    let guard = times_mutex.lock().await;
-                    guard
-                };
-                let time_elapsed =
-                    Instant::now().duration_since(*times.get(&(hop as usize)).unwrap());
+                let timetable = timetable.lock().await;
 
-                tx.send(Message::Ok((hop as u8, hostname, ip_addr, time_elapsed)))
+                let time_elapsed = match timetable.get(&hop) {
+                    Some(time) => Instant::now().duration_since(*time),
+                    None => bail!("did not found time {} in the timetable", hop),
+                };
+
+                tx.send(Message::Ok((hop, hostname, ip_addr, time_elapsed)))
                     .await?;
 
-                {
-                    let probed = probed_mutex.lock().await;
-                    let diff = (*probed).difference(&recvd);
+                let already_inspected = already_inspected.lock().await;
+                let diff = already_inspected.difference(&recvd);
 
-                    for d in diff {
-                        if *d < hop as u8 {
-                            tx.send(Message::Timeout(*d)).await?;
-                        }
+                for &d in diff {
+                    if d < hop as u8 {
+                        tx.send(Message::Timeout(d)).await?;
                     }
                 }
-            
+
                 semaphore.close();
 
                 tx.send(Message::Quit).await?;
 
-                break;
+                break Ok(());
             }
             _ => {}
         }
-
     }
-
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-enum Response {
-    WillArrive(u8, String, SocketAddr, Duration),
-    WontArrive(u8),
 }
 
 async fn print_results(mut rx: Receiver<Message>) {
-    /* The printer awaits messages from the receiver. Sometimes, the messages
+    /* The printer awaits messages from the receiver. Sometimetable, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
-     let mut responses: [Option<Response>; 255] = std::iter::repeat(None)
+    let mut responses: [Option<Response>; 255] = std::iter::repeat(None)
         .take(255)
         .collect::<Vec<_>>()
         .try_into()
@@ -312,7 +279,8 @@ async fn print_results(mut rx: Receiver<Message>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             Message::Ok((hop, hostname, ip_addr, time)) => {
-                responses[hop as usize - 1] = Some(Response::WillArrive(hop, hostname.clone(), ip_addr, time));
+                responses[hop as usize - 1] =
+                    Some(Response::WillArrive(hop, hostname.clone(), ip_addr, time));
             }
             Message::Timeout(hop) => {
                 responses[hop as usize - 1] = Some(Response::WontArrive(hop));
@@ -320,7 +288,7 @@ async fn print_results(mut rx: Receiver<Message>) {
             Message::Quit => break,
         }
 
-        while printed < 255 && !responses[printed].is_none() {
+        while printed < 255 && responses[printed].is_some() {
             if let Some(response) = responses[printed].clone() {
                 match response.clone() {
                     Response::WontArrive(hop) => {
@@ -334,9 +302,9 @@ async fn print_results(mut rx: Receiver<Message>) {
                 }
             }
         }
-
     }
 }
+
 fn build_ipv4_packet(
     buf: &mut [u8],
     dest: Ipv4Addr,
@@ -390,29 +358,24 @@ fn build_udp_packet(buf: &mut [u8]) -> NextPacket {
     NextPacket::Udp(packet)
 }
 
-fn to_ipaddr(target: &str) -> anyhow::Result<Ipv4Addr> {
+fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
     match target.parse::<Ipv4Addr>() {
         Ok(addr) => Ok(addr),
         Err(_) => match dns_lookup::lookup_host(target) {
             Ok(ip_addrs) => match ip_addrs[0] {
                 IpAddr::V4(addr) => Ok(addr),
-                IpAddr::V6(_) => return Err(anyhow!("Not implemented for IPv6.")),
+                IpAddr::V6(_) => bail!("not implemented for ipv6."),
             },
-            Err(_) => return Err(anyhow!("Couldn't resolve the hostname to IP.")),
+            Err(_) => bail!("couldn't resolve the hostname"),
         },
     }
 }
 
-fn create_sock() -> anyhow::Result<Arc<RawSocket>> {
+fn create_sock() -> Result<Arc<RawSocket>> {
     match RawSocket::new(Domain::ipv4(), Type::raw(), Protocol::icmpv4().into()) {
         Ok(sock) => Ok(Arc::new(sock)),
-        Err(_) => return Err(anyhow!("Couldn't create the socket.")),
+        Err(_) => bail!("couldn't create the socket"),
     }
-}
-
-enum NextPacket<'a> {
-    Udp(MutableUdpPacket<'a>),
-    Icmp(MutableEchoRequestPacket<'a>),
 }
 
 #[derive(Copy, Clone)]
@@ -421,14 +384,27 @@ enum TracerouteProtocol {
     Udp,
 }
 
-impl TracerouteProtocol {
-    fn from_str(protocol: &str) -> anyhow::Result<Self> {
-        match protocol {
+impl FromStr for TracerouteProtocol {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
             "icmp" => Ok(TracerouteProtocol::Icmp),
             "udp" => Ok(TracerouteProtocol::Udp),
-            _ => Err(anyhow!("Protocol not recognized.")),
+            _ => bail!("unsupported protocol: {}", s),
         }
     }
+}
+
+enum NextPacket<'a> {
+    Udp(MutableUdpPacket<'a>),
+    Icmp(MutableEchoRequestPacket<'a>),
+}
+
+#[derive(Debug, Clone)]
+enum Response {
+    WillArrive(u8, String, SocketAddr, Duration),
+    WontArrive(u8),
 }
 
 #[derive(Debug)]
