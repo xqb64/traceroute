@@ -28,10 +28,13 @@ use tokio::{
 
 const START_TTL: u8 = 0;
 const MAX_TASKS_IN_FLIGHT: usize = 4;
+
 const IP_HDR_LEN: usize = 20;
 const ICMP_HDR_LEN: usize = 8;
 const UDP_HDR_LEN: usize = 8;
+
 const TRACEROUTE_PORT: usize = 33434;
+
 const IPPROTO_RAW: i32 = 255;
 
 #[tokio::main]
@@ -40,7 +43,7 @@ async fn main() {
     let result = run(&opt.target, &opt.protocol).await;
 
     if let Err(e) = result {
-        println!("{}", e);
+        eprintln!("traceroute: {}", e);
     }
 }
 
@@ -212,6 +215,7 @@ async fn receive(
                     return Ok(());
                 }
             };
+
         ip_addr_opt = Some(ip_addr);
 
         icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
@@ -223,6 +227,7 @@ async fn receive(
             Some(packet) => packet,
             None => bail!("couldn't make ivp4 packet"),
         };
+
         hop = original_ipv4_packet.get_identification() as u8;
     }
 
