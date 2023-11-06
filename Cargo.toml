@@ -3,3 +3,4 @@ members = [
     "traceroute",
     "raw-socket",
 ]
+resolver = "2"

@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# Run cargo fmt and check for differences
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+  echo "Error: Code is not formatted properly using cargo fmt."
+  exit 1
+fi
+
+# Run cargo clippy
+cargo clippy -p traceroute --no-deps -- -D warnings
+if [ $? -ne 0 ]; then
+  echo "Error: Clippy found warnings or errors in the code."
+  exit 1
+fi
+
+# Run cargo test
+cargo test
+if [ $? -ne 0 ]; then
+  echo "Error: Some tests did not pass."
+  exit 1
+fi
+
+echo "All checks passed. Proceeding with the commit."
+exit 0
