@@ -11,3 +11,4 @@ dns-lookup = "1.0.8"
 rand = "0.8.4"
 structopt = { version = "0.3", default-features = false }
 anyhow = "1.0.65"
+console-subscriber = "0.2.0"

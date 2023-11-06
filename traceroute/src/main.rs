@@ -23,7 +23,7 @@ use tokio::{
         mpsc::{channel, Receiver, Sender},
         Mutex, Semaphore,
     },
-    time::{Duration, Instant},
+    time::{timeout, Duration, Instant},
 };
 
 const START_TTL: u8 = 0;
@@ -40,7 +40,7 @@ async fn main() {
     let result = run(&opt.target, &opt.protocol).await;
 
     if let Err(e) = result {
-        eprintln!("traceroute error: {:?}", e);
+        println!("{}", e);
     }
 }
 
@@ -55,34 +55,26 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
      * the TTL simultaneously. */
     let ttl = Arc::new(Mutex::new(START_TTL));
     let timetable = Arc::new(Mutex::new(HashMap::new()));
-    let already_inspected = Arc::new(Mutex::new(HashSet::new()));
+    let recvd = Arc::new(Mutex::new(HashSet::new()));
+    let wont_be_coming = Arc::new(Mutex::new(HashSet::new()));
 
     /* Memory channel for communicating between the printer and the receiver. */
     let (tx, rx) = channel(8192);
 
     let printer = tokio::spawn(print_results(rx));
-    let receiver = tokio::spawn(receive(
-        Arc::clone(&semaphore),
-        Arc::clone(&timetable),
-        tx,
-        Arc::clone(&already_inspected),
-    ));
 
     let mut tasks = vec![];
 
     for _ in 0..u8::MAX {
-        let semaphore = Arc::clone(&semaphore);
-        let counter = Arc::clone(&ttl);
-        let timetable = Arc::clone(&timetable);
-        let already_inspected = Arc::clone(&already_inspected);
-
         tasks.push(tokio::spawn(trace(
             target_ip,
             protocol,
-            semaphore,
-            counter,
-            timetable,
-            already_inspected,
+            semaphore.clone(),
+            ttl.clone(),
+            timetable.clone(),
+            tx.clone(),
+            recvd.clone(),
+            wont_be_coming.clone(),
         )));
     }
 
@@ -91,18 +83,20 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     }
 
     printer.await?;
-    receiver.await??;
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn trace(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
     semaphore: Arc<Semaphore>,
-    ttl_mutex: Arc<Mutex<u8>>,
+    ttl: Arc<Mutex<u8>>,
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
-    already_inspected: Arc<Mutex<HashSet<u8>>>,
+    tx: Sender<Message>,
+    recvd: Arc<Mutex<HashSet<SocketAddr>>>,
+    wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
      * We are limiting the number of tasks in flight so we don't end up
@@ -111,15 +105,26 @@ async fn trace(
     if let Ok(permit) = semaphore.acquire().await {
         /* Each task increments the TTL and sends a probe. */
         let ttl = {
-            let mut counter = ttl_mutex.lock().await;
+            let mut counter = ttl.lock().await;
             *counter += 1;
             *counter
         };
 
-        send_probe(target, protocol, ttl, Arc::clone(&timetable)).await?;
-
-        let mut already_inspected = already_inspected.lock().await;
-        already_inspected.insert(ttl);
+        for _ in 0..3 {
+            send_probe(target, protocol, ttl, timetable.clone()).await?;
+            if wont_be_coming.lock().await.contains(&ttl) {
+                return Ok(());
+            }
+            receive(
+                semaphore.clone(),
+                timetable.clone(),
+                ttl,
+                tx.clone(),
+                recvd.clone(),
+                wont_be_coming.clone(),
+            )
+            .await?;
+        }
 
         permit.forget();
     }
@@ -177,8 +182,7 @@ async fn send_probe(
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
     sock.send_to(ipv4_packet.packet(), (target, 0)).await?;
 
-    let mut timetable = timetable.lock().await;
-    timetable.insert(ttl, Instant::now());
+    timetable.lock().await.insert(ttl, Instant::now());
 
     Ok(())
 }
@@ -186,82 +190,88 @@ async fn send_probe(
 async fn receive(
     semaphore: Arc<Semaphore>,
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
+    ttl: u8,
     tx: Sender<Message>,
-    already_inspected: Arc<Mutex<HashSet<u8>>>,
+    recvd: Arc<Mutex<HashSet<SocketAddr>>>,
+    wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     let recv_sock = create_sock()?;
     let mut recv_buf = [0u8; 16536];
 
-    let mut recvd = HashSet::new();
+    let mut hop = 0;
+    let mut icmp_packet = None;
+    let mut ip_addr_opt = None;
 
-    loop {
-        let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
+    while hop != ttl {
+        let (_bytes_received, ip_addr) =
+            match timeout(Duration::from_secs(3), recv_sock.recv_from(&mut recv_buf)).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    tx.send(Message::Timeout(ttl)).await?;
+                    wont_be_coming.lock().await.insert(ttl);
+                    return Ok(());
+                }
+            };
+        ip_addr_opt = Some(ip_addr);
 
-        let icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
-            Some(packet) => packet,
+        icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
+            Some(packet) => Some(packet),
             None => bail!("couldn't make icmp packet"),
         };
-
-        let reverse_dns_task =
-            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.ip()));
-        let hostname = reverse_dns_task.await??;
 
         let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..]) {
             Some(packet) => packet,
             None => bail!("couldn't make ivp4 packet"),
         };
-        let hop = original_ipv4_packet.get_identification() as u8;
+        hop = original_ipv4_packet.get_identification() as u8;
+    }
 
-        recvd.insert(hop);
+    let ip_addr = ip_addr_opt.unwrap();
 
-        match icmp_packet.get_icmp_type() {
-            IcmpTypes::TimeExceeded => {
-                /* A part of the original IPv4 packet (header + at least first 8 bytes)
-                 * is contained in an ICMP error message. We use the identification field
-                 * to map responses back to correct hops. */
+    let reverse_dns_task =
+        tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.ip()));
 
-                let timetable = timetable.lock().await;
+    let hostname = reverse_dns_task.await??;
 
-                let time_elapsed = match timetable.get(&hop) {
-                    Some(time) => Instant::now().duration_since(*time),
-                    None => bail!("did not found time {} in the timetable", hop),
-                };
+    match icmp_packet.unwrap().get_icmp_type() {
+        IcmpTypes::TimeExceeded => {
+            /* A part of the original IPv4 packet (header + at least first 8 bytes)
+             * is contained in an ICMP error message. We use the identification field
+             * to map responses back to correct hops. */
 
+            let time_elapsed = match timetable.lock().await.get(&hop) {
+                Some(time) => Instant::now().duration_since(*time),
+                None => bail!("did not found time {} in the timetable", hop),
+            };
+
+            if !recvd.lock().await.contains(&ip_addr_opt.unwrap()) {
+                recvd.lock().await.insert(ip_addr_opt.unwrap());
                 tx.send(Message::Ok((hop, hostname, ip_addr, time_elapsed)))
                     .await?;
 
                 /* Allow one more task to go through. */
                 semaphore.add_permits(1);
             }
-            IcmpTypes::EchoReply | IcmpTypes::DestinationUnreachable => {
-                let timetable = timetable.lock().await;
+        }
+        IcmpTypes::EchoReply | IcmpTypes::DestinationUnreachable => {
+            let timetable = timetable.lock().await;
 
-                let time_elapsed = match timetable.get(&hop) {
-                    Some(time) => Instant::now().duration_since(*time),
-                    None => bail!("did not found time {} in the timetable", hop),
-                };
+            let time_elapsed = match timetable.get(&hop) {
+                Some(time) => Instant::now().duration_since(*time),
+                None => bail!("did not found time for hop {} in the timetable", hop),
+            };
 
+            if !recvd.lock().await.contains(&ip_addr) {
+                recvd.lock().await.insert(ip_addr);
                 tx.send(Message::Ok((hop, hostname, ip_addr, time_elapsed)))
                     .await?;
-
-                let already_inspected = already_inspected.lock().await;
-                let diff = already_inspected.difference(&recvd);
-
-                for &d in diff {
-                    if d < hop as u8 {
-                        tx.send(Message::Timeout(d)).await?;
-                    }
-                }
-
+                tx.send(Message::FinalHop(hop)).await?;
                 semaphore.close();
-
-                tx.send(Message::Quit).await?;
-
-                break Ok(());
             }
-            _ => {}
         }
+        _ => {}
     }
+    Ok(())
 }
 
 async fn print_results(mut rx: Receiver<Message>) {
@@ -275,6 +285,7 @@ async fn print_results(mut rx: Receiver<Message>) {
         .unwrap();
 
     let mut printed = 0;
+    let mut final_hop = 0;
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -282,10 +293,12 @@ async fn print_results(mut rx: Receiver<Message>) {
                 responses[hop as usize - 1] =
                     Some(Response::WillArrive(hop, hostname.clone(), ip_addr, time));
             }
+            Message::FinalHop(hop) => {
+                final_hop = hop;
+            }
             Message::Timeout(hop) => {
                 responses[hop as usize - 1] = Some(Response::WontArrive(hop));
             }
-            Message::Quit => break,
         }
 
         while printed < u8::MAX && responses[printed as usize].is_some() {
@@ -300,6 +313,9 @@ async fn print_results(mut rx: Receiver<Message>) {
                         printed += 1;
                     }
                 }
+            }
+            if printed == final_hop {
+                return;
             }
         }
     }
@@ -410,8 +426,8 @@ enum Response {
 #[derive(Debug)]
 enum Message {
     Ok((u8, String, SocketAddr, Duration)),
+    FinalHop(u8),
     Timeout(u8),
-    Quit,
 }
 
 #[derive(Debug, StructOpt)]
