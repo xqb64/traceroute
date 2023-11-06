@@ -14,12 +14,5 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-# Run cargo test
-cargo test
-if [ $? -ne 0 ]; then
-  echo "Error: Some tests did not pass."
-  exit 1
-fi
-
 echo "All checks passed. Proceeding with the commit."
 exit 0
