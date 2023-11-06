@@ -268,8 +268,8 @@ async fn print_results(mut rx: Receiver<Message>) {
     /* The printer awaits messages from the receiver. Sometimetable, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
-    let mut responses: [Option<Response>; 255] = std::iter::repeat(None)
-        .take(255)
+    let mut responses: [Option<Response>; u8::MAX as usize] = std::iter::repeat(None)
+        .take(u8::MAX as usize)
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
@@ -288,8 +288,8 @@ async fn print_results(mut rx: Receiver<Message>) {
             Message::Quit => break,
         }
 
-        while printed < 255 && responses[printed].is_some() {
-            if let Some(response) = responses[printed].clone() {
+        while printed < u8::MAX && responses[printed as usize].is_some() {
+            if let Some(response) = responses[printed as usize].clone() {
                 match response.clone() {
                     Response::WontArrive(hop) => {
                         println!("{}:  *** ", hop);
