@@ -64,7 +64,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     let receiver = tokio::spawn(receive(
         Arc::clone(&semaphore),
         Arc::clone(&timetable),
-        tx.clone(),
+        tx,
         Arc::clone(&already_inspected),
     ));
 
