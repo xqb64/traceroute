@@ -269,9 +269,9 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
         .try_into()
         .unwrap();
 
-    let mut printed = 0;
+    let mut last_printed = 0;
     let mut final_hop = 0;
-    let mut host2ip = HashMap::new();
+    let mut all_printed = HashSet::new();
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -287,23 +287,24 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
             }
         }
 
-        while printed < u8::MAX && responses[printed as usize].is_some() {
-            if let Some(response) = responses[printed as usize].clone() {
+        while last_printed < u8::MAX && responses[last_printed as usize].is_some() {
+            if let Some(response) = responses[last_printed as usize].clone() {
                 match response.clone() {
                     Response::WontArrive(hop) => {
                         println!("{}:  *** ", hop);
-                        printed += 1;
+                        last_printed += 1;
                     }
                     Response::WillArrive(hop, hostname, ip_addr, time) => {
-                        if !host2ip.contains_key(&hostname) {
-                            host2ip.insert(hostname.clone(), ip_addr);
+                        if !all_printed.contains(&ip_addr) {
                             println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
+                            all_printed.insert(ip_addr);
                         }
-                        printed += 1;
+                        last_printed += 1;
                     }
                 }
             }
-            if printed == final_hop {
+
+            if last_printed == final_hop {
                 semaphore.close();
                 return;
             }
