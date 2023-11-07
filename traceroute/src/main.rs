@@ -176,7 +176,7 @@ async fn send_probe(
 
     sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &1i32)?;
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
-    sock.send_to(ipv4_packet.packet(), (target, 0)).await?;
+    sock.send_to(ipv4_packet.packet(), (target, 33434)).await?;
 
     timetable.lock().await.insert(ttl, Instant::now());
 
@@ -191,10 +191,9 @@ async fn receive(
     wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     let recv_sock = create_sock()?;
-    let mut recv_buf = [0u8; 16536];
-
+    let mut recv_buf = [0u8; 65536];
     let mut hop = 0;
-    let mut icmp_packet = None;
+    let mut icmp_packet_opt = None;
     let mut ip_addr_opt = None;
 
     while hop != ttl {
@@ -202,6 +201,7 @@ async fn receive(
             match timeout(Duration::from_secs(3), recv_sock.recv_from(&mut recv_buf)).await {
                 Ok(result) => result.unwrap(),
                 Err(_) => {
+                    println!("sending Timeout for {}", ttl);
                     tx.send(Message::Timeout(ttl)).await?;
                     wont_be_coming.lock().await.insert(ttl);
                     return Ok(());
@@ -210,10 +210,17 @@ async fn receive(
 
         ip_addr_opt = Some(ip_addr);
 
-        icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
+        icmp_packet_opt = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
             Some(packet) => Some(packet),
             None => bail!("couldn't make icmp packet"),
         };
+
+        if let Some(ref packet) = icmp_packet_opt {
+            if packet.get_icmp_type() == IcmpTypes::EchoReply {
+                hop = ttl;
+                break;
+            }
+        }
 
         let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..]) {
             Some(packet) => packet,
@@ -223,6 +230,7 @@ async fn receive(
         hop = original_ipv4_packet.get_identification() as u8;
     }
 
+    let icmp_packet = icmp_packet_opt.unwrap();
     let ip_addr = ip_addr_opt.unwrap();
 
     let reverse_dns_task =
@@ -230,28 +238,35 @@ async fn receive(
 
     let hostname = reverse_dns_task.await??;
 
-    match icmp_packet.unwrap().get_icmp_type() {
+    match icmp_packet.get_icmp_type() {
         IcmpTypes::TimeExceeded => {
             /* A part of the original IPv4 packet (header + at least first 8 bytes)
              * is contained in an ICMP error message. We use the identification fi-
              * eld to map responses back to correct hops. */
 
-            let rtt = time_for_hop(timetable, hop).await?;
+            let rtt = time_for_hop(&timetable, hop).await?;
 
-            /* We haven't received for this ip addr, go ahead. */
-            tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
+            let _ = tx.send(Message::Ok(hop, hostname, ip_addr, rtt)).await;
 
             /* Allow one more task to go through. */
             semaphore.add_permits(1);
         }
-        IcmpTypes::EchoReply | IcmpTypes::DestinationUnreachable => {
-            let rtt = time_for_hop(timetable, hop).await?;
+        IcmpTypes::EchoReply => {
+            let rtt = time_for_hop(&timetable, hop).await?;
 
-            /* We haven't received for this ip_addr, go ahead. */
-            tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
+            let _ = tx
+                .send(Message::EchoReply(hop, hostname, ip_addr, rtt))
+                .await;
+        }
+        IcmpTypes::DestinationUnreachable => {
+            let rtt = time_for_hop(&timetable, hop).await?;
+            let code = icmp_packet.get_icmp_code();
 
-            /* Notify the printer that this our final hop. */
-            tx.send(Message::FinalHop(hop)).await?;
+            let _ = tx
+                .send(Message::DestinationUnreachable(
+                    hop, hostname, ip_addr, rtt, code,
+                ))
+                .await;
         }
         _ => {}
     }
@@ -273,43 +288,76 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
     let mut final_hop = 0;
     let mut all_printed = HashSet::new();
 
-    while let Some(msg) = rx.recv().await {
+    'mainloop: while let Some(msg) = rx.recv().await {
         match msg {
-            Message::Ok((hop, hostname, ip_addr, time)) => {
+            Message::Ok(hop, hostname, ip_addr, time) => {
                 responses[hop as usize - 1] =
-                    Some(Response::WillArrive(hop, hostname.clone(), ip_addr, time));
+                    Some(Response::TimeExceeded(hop, hostname.clone(), ip_addr, time));
             }
-            Message::FinalHop(hop) => {
+            Message::DestinationUnreachable(hop, hostname, ip_addr, time, code) => {
+                responses[hop as usize - 1] = Some(Response::DestinationUnreachable(
+                    hop,
+                    hostname.clone(),
+                    ip_addr,
+                    time,
+                    code,
+                ));
+            }
+            Message::EchoReply(hop, hostname, ip_addr, time) => {
+                responses[hop as usize - 1] =
+                    Some(Response::EchoReply(hop, hostname.clone(), ip_addr, time));
                 final_hop = hop;
             }
             Message::Timeout(hop) => {
-                responses[hop as usize - 1] = Some(Response::WontArrive(hop));
+                responses[hop as usize - 1] = Some(Response::Timeout(hop));
             }
         }
 
         while last_printed < u8::MAX && responses[last_printed as usize].is_some() {
             if let Some(response) = responses[last_printed as usize].clone() {
                 match response.clone() {
-                    Response::WontArrive(hop) => {
-                        println!("{}:  *** ", hop);
-                        last_printed += 1;
-                    }
-                    Response::WillArrive(hop, hostname, ip_addr, time) => {
+                    Response::TimeExceeded(hop, hostname, ip_addr, time) => {
                         if !all_printed.contains(&ip_addr) {
                             println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
                             all_printed.insert(ip_addr);
                         }
                         last_printed += 1;
                     }
+                    Response::Timeout(hop) => {
+                        println!("{}:  *** ", hop);
+                        last_printed += 1;
+                    }
+                    Response::DestinationUnreachable(hop, hostname, ip_addr, time, code) => {
+                        if !all_printed.contains(&ip_addr) {
+                            println!(
+                                "{}: {} ({}) - {:?} -- destination unreachable ({:?})",
+                                hop, hostname, ip_addr, time, code
+                            );
+                            all_printed.insert(ip_addr);
+                        }
+                        last_printed += 1;
+                        final_hop = hop;
+                    }
+                    Response::EchoReply(hop, hostname, ip_addr, time) => {
+                        if !all_printed.contains(&ip_addr) {
+                            println!(
+                                "{}: {} ({}) - {:?} -- echo reply",
+                                hop, hostname, ip_addr, time
+                            );
+                            all_printed.insert(ip_addr);
+                        }
+                        last_printed += 1;
+                        final_hop = hop;
+                    }
                 }
             }
 
             if last_printed == final_hop {
-                semaphore.close();
-                return;
+                break 'mainloop;
             }
         }
     }
+    semaphore.close();
 }
 
 fn build_ipv4_packet(
@@ -348,7 +396,7 @@ fn build_icmp_packet(buf: &mut [u8]) -> NextPacket {
     packet.set_icmp_type(IcmpTypes::EchoRequest);
     packet.set_icmp_code(IcmpCode::new(0));
     packet.set_sequence_number(seq_no);
-    packet.set_identifier(0x1337);
+    packet.set_identifier(0x1234);
     packet.set_checksum(checksum(&IcmpPacket::new(packet.packet()).unwrap()));
 
     NextPacket::Icmp(packet)
@@ -385,7 +433,7 @@ fn create_sock() -> Result<Arc<RawSocket>> {
     }
 }
 
-async fn time_for_hop(timetable: Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> Result<Duration> {
+async fn time_for_hop(timetable: &Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> Result<Duration> {
     match timetable.lock().await.get(&hop) {
         Some(time) => Ok(Instant::now().duration_since(*time)),
         None => bail!("did not find time {} in the timetable", hop),
@@ -417,14 +465,17 @@ enum NextPacket<'a> {
 
 #[derive(Debug, Clone)]
 enum Response {
-    WillArrive(u8, String, SocketAddr, Duration),
-    WontArrive(u8),
+    TimeExceeded(u8, String, SocketAddr, Duration),
+    DestinationUnreachable(u8, String, SocketAddr, Duration, IcmpCode),
+    EchoReply(u8, String, SocketAddr, Duration),
+    Timeout(u8),
 }
 
 #[derive(Debug)]
 enum Message {
-    Ok((u8, String, SocketAddr, Duration)),
-    FinalHop(u8),
+    Ok(u8, String, SocketAddr, Duration),
+    DestinationUnreachable(u8, String, SocketAddr, Duration, IcmpCode),
+    EchoReply(u8, String, SocketAddr, Duration),
     Timeout(u8),
 }
 
