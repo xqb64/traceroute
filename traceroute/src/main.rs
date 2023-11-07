@@ -275,7 +275,7 @@ async fn receive(
 }
 
 async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
-    /* The printer awaits messages from the receiver. Sometimetable, the messages
+    /* The printer awaits messages from the receiver. Sometimes, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
     let mut responses: [Option<Response>; u8::MAX as usize] = std::iter::repeat(None)
