@@ -58,13 +58,14 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
      * the TTL simultaneously. */
     let ttl = Arc::new(Mutex::new(START_TTL));
     let timetable = Arc::new(Mutex::new(HashMap::new()));
-    let recvd = Arc::new(Mutex::new(HashSet::new()));
+    let recvd_ip = Arc::new(Mutex::new(HashSet::new()));
+    let recvd_hops = Arc::new(Mutex::new(HashSet::new()));
     let wont_be_coming = Arc::new(Mutex::new(HashSet::new()));
 
     /* Memory channel for communicating between the printer and the receiver. */
     let (tx, rx) = channel(8192);
 
-    let printer = tokio::spawn(print_results(rx));
+    let printer = tokio::spawn(print_results(rx, semaphore.clone()));
 
     let mut tasks = vec![];
 
@@ -76,7 +77,8 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
             ttl.clone(),
             timetable.clone(),
             tx.clone(),
-            recvd.clone(),
+            recvd_ip.clone(),
+            recvd_hops.clone(),
             wont_be_coming.clone(),
         )));
     }
@@ -98,7 +100,8 @@ async fn trace(
     ttl: Arc<Mutex<u8>>,
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
     tx: Sender<Message>,
-    recvd: Arc<Mutex<HashSet<SocketAddr>>>,
+    recvd_ip: Arc<Mutex<HashSet<SocketAddr>>>,
+    recvd_hops: Arc<Mutex<HashSet<u8>>>,
     wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
@@ -115,19 +118,17 @@ async fn trace(
 
         for _ in 0..3 {
             send_probe(target, protocol, ttl, timetable.clone()).await?;
-            if wont_be_coming.lock().await.contains(&ttl) {
-                return Ok(());
-            }
-            receive(
-                semaphore.clone(),
-                timetable.clone(),
-                ttl,
-                tx.clone(),
-                recvd.clone(),
-                wont_be_coming.clone(),
-            )
-            .await?;
         }
+        receive(
+            semaphore.clone(),
+            timetable.clone(),
+            ttl,
+            tx.clone(),
+            recvd_ip.clone(),
+            recvd_hops.clone(),
+            wont_be_coming.clone(),
+        )
+        .await?;
 
         permit.forget();
     }
@@ -195,7 +196,8 @@ async fn receive(
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
     ttl: u8,
     tx: Sender<Message>,
-    recvd: Arc<Mutex<HashSet<SocketAddr>>>,
+    recvd_ip: Arc<Mutex<HashSet<SocketAddr>>>,
+    recvd_hops: Arc<Mutex<HashSet<u8>>>,
     wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     let recv_sock = create_sock()?;
@@ -241,45 +243,54 @@ async fn receive(
     match icmp_packet.unwrap().get_icmp_type() {
         IcmpTypes::TimeExceeded => {
             /* A part of the original IPv4 packet (header + at least first 8 bytes)
-             * is contained in an ICMP error message. We use the identification field
-             * to map responses back to correct hops. */
+             * is contained in an ICMP error message. We use the identification fi-
+             * eld to map responses back to correct hops. */
 
-            let time_elapsed = match timetable.lock().await.get(&hop) {
-                Some(time) => Instant::now().duration_since(*time),
-                None => bail!("did not found time {} in the timetable", hop),
-            };
+            let rtt = time_for_hop(timetable, hop).await?;
 
-            if !recvd.lock().await.contains(&ip_addr_opt.unwrap()) {
-                recvd.lock().await.insert(ip_addr_opt.unwrap());
-                tx.send(Message::Ok((hop, hostname, ip_addr, time_elapsed)))
-                    .await?;
+            /* Prevent sending out duplicate messages. */
+            if !try_insert(recvd_ip, ip_addr).await {
+                /* We haven't received for this ip addr, go ahead. */
+                tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
+                recvd_hops.lock().await.insert(hop);
 
                 /* Allow one more task to go through. */
                 semaphore.add_permits(1);
+            } else {
+                tx.send(Message::Duplicate((hop, hostname, ip_addr, rtt)))
+                    .await?;
             }
         }
         IcmpTypes::EchoReply | IcmpTypes::DestinationUnreachable => {
-            let timetable = timetable.lock().await;
+            let rtt = time_for_hop(timetable, hop).await?;
 
-            let time_elapsed = match timetable.get(&hop) {
-                Some(time) => Instant::now().duration_since(*time),
-                None => bail!("did not found time for hop {} in the timetable", hop),
-            };
+            /* Prevent sending out duplicate messages. */
+            if !try_insert(recvd_ip, ip_addr).await {
+                /* We haven't received for this ip_addr, go ahead. */
+                tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
 
-            if !recvd.lock().await.contains(&ip_addr) {
-                recvd.lock().await.insert(ip_addr);
-                tx.send(Message::Ok((hop, hostname, ip_addr, time_elapsed)))
-                    .await?;
+                /* Notify the printer that this our final hop. */
                 tx.send(Message::FinalHop(hop)).await?;
-                semaphore.close();
+                recvd_hops.lock().await.insert(hop);
+
+                // println!("closing the semaphore");
+
+                // tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // /* Close the semaphore. */
+                // semaphore.close();
+            } else {
+                tx.send(Message::Duplicate((hop, hostname, ip_addr, rtt)))
+                    .await?;
             }
         }
         _ => {}
     }
+
     Ok(())
 }
 
-async fn print_results(mut rx: Receiver<Message>) {
+async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
     /* The printer awaits messages from the receiver. Sometimetable, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
@@ -297,6 +308,10 @@ async fn print_results(mut rx: Receiver<Message>) {
             Message::Ok((hop, hostname, ip_addr, time)) => {
                 responses[hop as usize - 1] =
                     Some(Response::WillArrive(hop, hostname.clone(), ip_addr, time));
+            }
+            Message::Duplicate((hop, hostname, ip_addr, time)) => {
+                responses[hop as usize - 1] =
+                    Some(Response::Duplicate(hop, hostname.clone(), ip_addr, time));
             }
             Message::FinalHop(hop) => {
                 final_hop = hop;
@@ -317,9 +332,14 @@ async fn print_results(mut rx: Receiver<Message>) {
                         println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
                         printed += 1;
                     }
+                    Response::Duplicate(hop, hostname, ip_addr, time) => {
+                        println!("{}: {} ({}) - {:?} -- dupe", hop, hostname, ip_addr, time);
+                        printed += 1;
+                    }
                 }
             }
             if printed == final_hop {
+                semaphore.close();
                 return;
             }
         }
@@ -399,6 +419,23 @@ fn create_sock() -> Result<Arc<RawSocket>> {
     }
 }
 
+/// Returns false if ip_addr was not already in recvd, otherwise true.
+async fn try_insert(recvd: Arc<Mutex<HashSet<SocketAddr>>>, ip_addr: SocketAddr) -> bool {
+    let mut recvd = recvd.lock().await;
+    if !recvd.contains(&ip_addr) {
+        recvd.insert(ip_addr);
+        return false;
+    }
+    true
+}
+
+async fn time_for_hop(timetable: Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> Result<Duration> {
+    match timetable.lock().await.get(&hop) {
+        Some(time) => Ok(Instant::now().duration_since(*time)),
+        None => bail!("did not find time {} in the timetable", hop),
+    }
+}
+
 #[derive(Copy, Clone)]
 enum TracerouteProtocol {
     Icmp,
@@ -425,12 +462,14 @@ enum NextPacket<'a> {
 #[derive(Debug, Clone)]
 enum Response {
     WillArrive(u8, String, SocketAddr, Duration),
+    Duplicate(u8, String, SocketAddr, Duration),
     WontArrive(u8),
 }
 
 #[derive(Debug)]
 enum Message {
     Ok((u8, String, SocketAddr, Duration)),
+    Duplicate((u8, String, SocketAddr, Duration)),
     FinalHop(u8),
     Timeout(u8),
 }
