@@ -217,6 +217,7 @@ async fn receive(
 
         if let Some(ref packet) = icmp_packet_opt {
             if packet.get_icmp_type() == IcmpTypes::EchoReply {
+                /* For some reason, on EchoReply, hop is zero. */
                 hop = ttl;
                 break;
             }
