@@ -222,6 +222,9 @@ async fn receive(
             }
         }
 
+        /* A part of the original IPv4 packet (header + at least first 8 bytes)
+         * is contained in an ICMP error message. We use the identification fi-
+         * eld to map responses back to correct hops. */
         let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..]) {
             Some(packet) => packet,
             None => bail!("couldn't make ivp4 packet"),
@@ -240,10 +243,6 @@ async fn receive(
 
     match icmp_packet.get_icmp_type() {
         IcmpTypes::TimeExceeded => {
-            /* A part of the original IPv4 packet (header + at least first 8 bytes)
-             * is contained in an ICMP error message. We use the identification fi-
-             * eld to map responses back to correct hops. */
-
             let rtt = time_for_hop(&timetable, hop).await?;
 
             let _ = tx.send(Message::Ok(hop, hostname, ip_addr, rtt)).await;
