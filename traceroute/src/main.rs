@@ -58,8 +58,6 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
      * the TTL simultaneously. */
     let ttl = Arc::new(Mutex::new(START_TTL));
     let timetable = Arc::new(Mutex::new(HashMap::new()));
-    let recvd_ip = Arc::new(Mutex::new(HashSet::new()));
-    let recvd_hops = Arc::new(Mutex::new(HashSet::new()));
     let wont_be_coming = Arc::new(Mutex::new(HashSet::new()));
 
     /* Memory channel for communicating between the printer and the receiver. */
@@ -77,8 +75,6 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
             ttl.clone(),
             timetable.clone(),
             tx.clone(),
-            recvd_ip.clone(),
-            recvd_hops.clone(),
             wont_be_coming.clone(),
         )));
     }
@@ -100,8 +96,6 @@ async fn trace(
     ttl: Arc<Mutex<u8>>,
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
     tx: Sender<Message>,
-    recvd_ip: Arc<Mutex<HashSet<SocketAddr>>>,
-    recvd_hops: Arc<Mutex<HashSet<u8>>>,
     wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
@@ -124,8 +118,6 @@ async fn trace(
             timetable.clone(),
             ttl,
             tx.clone(),
-            recvd_ip.clone(),
-            recvd_hops.clone(),
             wont_be_coming.clone(),
         )
         .await?;
@@ -196,8 +188,6 @@ async fn receive(
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
     ttl: u8,
     tx: Sender<Message>,
-    recvd_ip: Arc<Mutex<HashSet<SocketAddr>>>,
-    recvd_hops: Arc<Mutex<HashSet<u8>>>,
     wont_be_coming: Arc<Mutex<HashSet<u8>>>,
 ) -> Result<()> {
     let recv_sock = create_sock()?;
@@ -248,34 +238,20 @@ async fn receive(
 
             let rtt = time_for_hop(timetable, hop).await?;
 
-            /* Prevent sending out duplicate messages. */
-            if !try_insert(recvd_ip, ip_addr).await {
-                /* We haven't received for this ip addr, go ahead. */
-                tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
-                recvd_hops.lock().await.insert(hop);
+            /* We haven't received for this ip addr, go ahead. */
+            tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
 
-                /* Allow one more task to go through. */
-                semaphore.add_permits(1);
-            } else {
-                tx.send(Message::Duplicate((hop, hostname, ip_addr, rtt)))
-                    .await?;
-            }
+            /* Allow one more task to go through. */
+            semaphore.add_permits(1);
         }
         IcmpTypes::EchoReply | IcmpTypes::DestinationUnreachable => {
             let rtt = time_for_hop(timetable, hop).await?;
 
-            /* Prevent sending out duplicate messages. */
-            if !try_insert(recvd_ip, ip_addr).await {
-                /* We haven't received for this ip_addr, go ahead. */
-                tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
+            /* We haven't received for this ip_addr, go ahead. */
+            tx.send(Message::Ok((hop, hostname, ip_addr, rtt))).await?;
 
-                /* Notify the printer that this our final hop. */
-                tx.send(Message::FinalHop(hop)).await?;
-                recvd_hops.lock().await.insert(hop);
-            } else {
-                tx.send(Message::Duplicate((hop, hostname, ip_addr, rtt)))
-                    .await?;
-            }
+            /* Notify the printer that this our final hop. */
+            tx.send(Message::FinalHop(hop)).await?;
         }
         _ => {}
     }
@@ -295,16 +271,13 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
 
     let mut printed = 0;
     let mut final_hop = 0;
+    let mut host2ip = HashMap::new();
 
     while let Some(msg) = rx.recv().await {
         match msg {
             Message::Ok((hop, hostname, ip_addr, time)) => {
                 responses[hop as usize - 1] =
                     Some(Response::WillArrive(hop, hostname.clone(), ip_addr, time));
-            }
-            Message::Duplicate((hop, hostname, ip_addr, time)) => {
-                responses[hop as usize - 1] =
-                    Some(Response::Duplicate(hop, hostname.clone(), ip_addr, time));
             }
             Message::FinalHop(hop) => {
                 final_hop = hop;
@@ -322,11 +295,10 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
                         printed += 1;
                     }
                     Response::WillArrive(hop, hostname, ip_addr, time) => {
-                        println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
-                        printed += 1;
-                    }
-                    Response::Duplicate(hop, hostname, ip_addr, time) => {
-                        println!("{}: {} ({}) - {:?} -- dupe", hop, hostname, ip_addr, time);
+                        if !host2ip.contains_key(&hostname) {
+                            host2ip.insert(hostname.clone(), ip_addr);
+                            println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
+                        }
                         printed += 1;
                     }
                 }
@@ -412,16 +384,6 @@ fn create_sock() -> Result<Arc<RawSocket>> {
     }
 }
 
-/// Returns false if ip_addr was not already in recvd, otherwise true.
-async fn try_insert(recvd: Arc<Mutex<HashSet<SocketAddr>>>, ip_addr: SocketAddr) -> bool {
-    let mut recvd = recvd.lock().await;
-    if !recvd.contains(&ip_addr) {
-        recvd.insert(ip_addr);
-        return false;
-    }
-    true
-}
-
 async fn time_for_hop(timetable: Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> Result<Duration> {
     match timetable.lock().await.get(&hop) {
         Some(time) => Ok(Instant::now().duration_since(*time)),
@@ -455,14 +417,12 @@ enum NextPacket<'a> {
 #[derive(Debug, Clone)]
 enum Response {
     WillArrive(u8, String, SocketAddr, Duration),
-    Duplicate(u8, String, SocketAddr, Duration),
     WontArrive(u8),
 }
 
 #[derive(Debug)]
 enum Message {
     Ok((u8, String, SocketAddr, Duration)),
-    Duplicate((u8, String, SocketAddr, Duration)),
     FinalHop(u8),
     Timeout(u8),
 }
