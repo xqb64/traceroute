@@ -320,9 +320,9 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
             if let Some(response) = responses[last_printed as usize].clone() {
                 match response.clone() {
                     Message::TimeExceeded((hop, hostname, ip_addr, time)) => {
-                        if !all_printed.contains(&ip_addr) {
+                        if !all_printed.contains(&(hop, ip_addr)) {
                             println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
-                            all_printed.insert(ip_addr);
+                            all_printed.insert((hop, ip_addr));
                         }
                         last_printed += 1;
                     }
@@ -331,23 +331,23 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
                         last_printed += 1;
                     }
                     Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
-                        if !all_printed.contains(&ip_addr) {
+                        if !all_printed.contains(&(hop, ip_addr)) {
                             println!(
                                 "{}: {} ({}) - {:?} -- destination unreachable ({:?})",
                                 hop, hostname, ip_addr, time, code
                             );
-                            all_printed.insert(ip_addr);
+                            all_printed.insert((hop, ip_addr));
                         }
                         last_printed += 1;
                         final_hop = hop;
                     }
                     Message::EchoReply((hop, hostname, ip_addr, time)) => {
-                        if !all_printed.contains(&ip_addr) {
+                        if !all_printed.contains(&(hop, ip_addr)) {
                             println!(
                                 "{}: {} ({}) - {:?} -- echo reply",
                                 hop, hostname, ip_addr, time
                             );
-                            all_printed.insert(ip_addr);
+                            all_printed.insert((hop, ip_addr));
                         }
                         last_printed += 1;
                         final_hop = hop;
