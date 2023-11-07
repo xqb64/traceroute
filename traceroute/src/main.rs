@@ -272,13 +272,6 @@ async fn receive(
                 /* Notify the printer that this our final hop. */
                 tx.send(Message::FinalHop(hop)).await?;
                 recvd_hops.lock().await.insert(hop);
-
-                // println!("closing the semaphore");
-
-                // tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                // /* Close the semaphore. */
-                // semaphore.close();
             } else {
                 tx.send(Message::Duplicate((hop, hostname, ip_addr, rtt)))
                     .await?;
