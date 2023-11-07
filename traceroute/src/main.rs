@@ -245,7 +245,9 @@ async fn receive(
         IcmpTypes::TimeExceeded => {
             let rtt = time_for_hop(&timetable, hop).await?;
 
-            let _ = tx.send(Message::Ok(hop, hostname, ip_addr, rtt)).await;
+            let _ = tx
+                .send(Message::TimeExceeded(hop, hostname, ip_addr, rtt))
+                .await;
 
             /* Allow one more task to go through. */
             semaphore.add_permits(1);
@@ -277,7 +279,7 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
     /* The printer awaits messages from the receiver. Sometimes, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
-    let mut responses: [Option<Response>; u8::MAX as usize] = std::iter::repeat(None)
+    let mut responses: [Option<Message>; u8::MAX as usize] = std::iter::repeat(None)
         .take(u8::MAX as usize)
         .collect::<Vec<_>>()
         .try_into()
@@ -289,12 +291,12 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
 
     'mainloop: while let Some(msg) = rx.recv().await {
         match msg {
-            Message::Ok(hop, hostname, ip_addr, time) => {
+            Message::TimeExceeded(hop, hostname, ip_addr, time) => {
                 responses[hop as usize - 1] =
-                    Some(Response::TimeExceeded(hop, hostname.clone(), ip_addr, time));
+                    Some(Message::TimeExceeded(hop, hostname.clone(), ip_addr, time));
             }
             Message::DestinationUnreachable(hop, hostname, ip_addr, time, code) => {
-                responses[hop as usize - 1] = Some(Response::DestinationUnreachable(
+                responses[hop as usize - 1] = Some(Message::DestinationUnreachable(
                     hop,
                     hostname.clone(),
                     ip_addr,
@@ -304,29 +306,29 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
             }
             Message::EchoReply(hop, hostname, ip_addr, time) => {
                 responses[hop as usize - 1] =
-                    Some(Response::EchoReply(hop, hostname.clone(), ip_addr, time));
+                    Some(Message::EchoReply(hop, hostname.clone(), ip_addr, time));
                 final_hop = hop;
             }
             Message::Timeout(hop) => {
-                responses[hop as usize - 1] = Some(Response::Timeout(hop));
+                responses[hop as usize - 1] = Some(Message::Timeout(hop));
             }
         }
 
         while last_printed < u8::MAX && responses[last_printed as usize].is_some() {
             if let Some(response) = responses[last_printed as usize].clone() {
                 match response.clone() {
-                    Response::TimeExceeded(hop, hostname, ip_addr, time) => {
+                    Message::TimeExceeded(hop, hostname, ip_addr, time) => {
                         if !all_printed.contains(&ip_addr) {
                             println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
                             all_printed.insert(ip_addr);
                         }
                         last_printed += 1;
                     }
-                    Response::Timeout(hop) => {
+                    Message::Timeout(hop) => {
                         println!("{}:  *** ", hop);
                         last_printed += 1;
                     }
-                    Response::DestinationUnreachable(hop, hostname, ip_addr, time, code) => {
+                    Message::DestinationUnreachable(hop, hostname, ip_addr, time, code) => {
                         if !all_printed.contains(&ip_addr) {
                             println!(
                                 "{}: {} ({}) - {:?} -- destination unreachable ({:?})",
@@ -337,7 +339,7 @@ async fn print_results(mut rx: Receiver<Message>, semaphore: Arc<Semaphore>) {
                         last_printed += 1;
                         final_hop = hop;
                     }
-                    Response::EchoReply(hop, hostname, ip_addr, time) => {
+                    Message::EchoReply(hop, hostname, ip_addr, time) => {
                         if !all_printed.contains(&ip_addr) {
                             println!(
                                 "{}: {} ({}) - {:?} -- echo reply",
@@ -463,16 +465,8 @@ enum NextPacket<'a> {
 }
 
 #[derive(Debug, Clone)]
-enum Response {
-    TimeExceeded(u8, String, SocketAddr, Duration),
-    DestinationUnreachable(u8, String, SocketAddr, Duration, IcmpCode),
-    EchoReply(u8, String, SocketAddr, Duration),
-    Timeout(u8),
-}
-
-#[derive(Debug)]
 enum Message {
-    Ok(u8, String, SocketAddr, Duration),
+    TimeExceeded(u8, String, SocketAddr, Duration),
     DestinationUnreachable(u8, String, SocketAddr, Duration, IcmpCode),
     EchoReply(u8, String, SocketAddr, Duration),
     Timeout(u8),
