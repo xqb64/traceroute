@@ -201,7 +201,6 @@ async fn receive(
             match timeout(Duration::from_secs(3), recv_sock.recv_from(&mut recv_buf)).await {
                 Ok(result) => result.unwrap(),
                 Err(_) => {
-                    println!("sending Timeout for {}", ttl);
                     tx.send(Message::Timeout(ttl)).await?;
                     wont_be_coming.lock().await.insert(ttl);
                     return Ok(());
