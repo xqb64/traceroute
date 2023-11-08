@@ -344,33 +344,24 @@ async fn print_results(
     'mainloop: while let Some(msg) = rx1.recv().await {
         let mut rguard = { responses.lock().await };
         match msg {
-            Message::TimeExceeded((hop, hostname, ip_addr, time)) => {
+            Message::TimeExceeded((hop, _, _, _)) => {
                 if rguard[hop as usize - 1].is_none() {
-                    rguard[hop as usize - 1] = Some(Message::TimeExceeded((
-                        hop,
-                        hostname.clone(),
-                        ip_addr,
-                        time,
-                    )));
+                    rguard[hop as usize - 1] = Some(msg);
                     info!("printer: got TimeExceeded for hop {}", hop);
                 }
             }
-            Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
+            Message::DestinationUnreachable((hop, _, _, _), _) => {
                 if rguard[hop as usize - 1].is_none() && final_hop == 0 {
-                    rguard[hop as usize - 1] = Some(Message::DestinationUnreachable(
-                        (hop, hostname.clone(), ip_addr, time),
-                        code,
-                    ));
+                    rguard[hop as usize - 1] = Some(msg);
                     info!("printer: got DestinationUnreachable for hop {}", hop);
 
                     final_hop = hop;
                     info!("printer: set final_hop to {}", final_hop);
                 }
             }
-            Message::EchoReply((hop, hostname, ip_addr, time)) => {
+            Message::EchoReply((hop, _, _, _)) => {
                 if rguard[hop as usize - 1].is_none() {
-                    rguard[hop as usize - 1] =
-                        Some(Message::EchoReply((hop, hostname.clone(), ip_addr, time)));
+                    rguard[hop as usize - 1] = Some(msg);
                     info!("printer: got EchoReply for hop {}", hop);
 
                     final_hop = hop;
@@ -379,7 +370,7 @@ async fn print_results(
             }
             Message::Timeout(hop) => {
                 if rguard[hop as usize - 1].is_none() {
-                    rguard[hop as usize - 1] = Some(Message::Timeout(hop));
+                    rguard[hop as usize - 1] = Some(msg);
                     info!("printer: got Timeout for hop {}", hop);
                 }
             }
@@ -397,7 +388,7 @@ async fn print_results(
                         }
                     }
                     Message::Timeout(hop) => {
-                        println!("timeout {}:  *** ", hop);
+                        println!("{}:  *** ", hop);
                         last_printed += 1;
                     }
                     Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
@@ -426,16 +417,16 @@ async fn print_results(
             }
 
             if last_printed == final_hop {
-                info!(
-                    "printer: printed final_hop ({}), sending BreakReceiver and breaking",
-                    final_hop
-                );
+                info!("printer: printed final_hop ({})", final_hop);
                 tx2.send(Message::BreakReceiver).await?;
+
+                info!("printer: sent BreakReceiver");
                 break 'mainloop;
             }
         }
     }
 
+    info!("printer: exiting");
     Ok(())
 }
 
