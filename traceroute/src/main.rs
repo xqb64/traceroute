@@ -219,7 +219,7 @@ async fn send_probe(
 
     let next_packet = match protocol {
         TracerouteProtocol::Udp => build_udp_packet(&mut ip_next_hdr_buf),
-        TracerouteProtocol::Icmp => build_icmp_packet(&mut ip_next_hdr_buf),
+        TracerouteProtocol::Icmp => build_icmp_packet(&mut ip_next_hdr_buf, ttl as u16),
     };
 
     match next_packet {
@@ -280,8 +280,11 @@ async fn receive(
             None => bail!("couldn't make ivp4 packet"),
         };
 
-        let hop = original_ipv4_packet.get_identification() as u8;
-        info!("receiver: extracted hop {}", hop);
+        let hop = if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
+            id_from_payload(icmp_packet.payload())
+        } else {
+            original_ipv4_packet.get_identification()
+        } as u8;
 
         let hostname =
             tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.ip())).await??;
@@ -299,10 +302,10 @@ async fn receive(
                 semaphore.add_permits(1);
             }
             IcmpTypes::EchoReply => {
-                let rtt = time_for_hop(&timetable, hop + 1).await?;
+                let rtt = time_for_hop(&timetable, hop).await?;
 
-                info!("receiver: sending EchoReply for hop {}", hop + 1);
-                tx1.send(Message::EchoReply((hop + 1, hostname, ip_addr, rtt)))
+                info!("receiver: sending EchoReply for hop {}", hop);
+                tx1.send(Message::EchoReply((hop, hostname, ip_addr, rtt)))
                     .await?;
             }
             IcmpTypes::DestinationUnreachable => {
@@ -462,7 +465,7 @@ fn build_ipv4_packet(
     packet
 }
 
-fn build_icmp_packet(buf: &mut [u8]) -> NextPacket {
+fn build_icmp_packet(buf: &mut [u8], ttl: u16) -> NextPacket {
     use pnet::packet::icmp::checksum;
 
     let mut packet = MutableEchoRequestPacket::new(buf).unwrap();
@@ -471,7 +474,7 @@ fn build_icmp_packet(buf: &mut [u8]) -> NextPacket {
     packet.set_icmp_type(IcmpTypes::EchoRequest);
     packet.set_icmp_code(IcmpCode::new(0));
     packet.set_sequence_number(seq_no);
-    packet.set_identifier(0x1234);
+    packet.set_identifier(ttl);
     packet.set_checksum(checksum(&IcmpPacket::new(packet.packet()).unwrap()));
 
     NextPacket::Icmp(packet)
@@ -499,6 +502,14 @@ fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
             Err(_) => bail!("couldn't resolve the hostname"),
         },
     }
+}
+
+fn id_from_payload(payload: &[u8]) -> u16 {
+    let identifier = &payload[0..4];
+    let mut id = identifier[0] as u16;
+    id <<= 8;
+    id |= identifier[1] as u16;
+    id
 }
 
 fn create_sock() -> Result<Arc<RawSocket>> {
