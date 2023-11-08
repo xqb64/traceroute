@@ -25,6 +25,7 @@ use tokio::{
     },
     time::{Duration, Instant},
 };
+use tracing::info;
 
 const START_TTL: u8 = 0;
 const MAX_TASKS_IN_FLIGHT: usize = 4;
@@ -39,6 +40,7 @@ const IPPROTO_RAW: i32 = 255;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
     let opt = Opt::from_args();
     let result = run(&opt.target, &opt.protocol).await;
 
@@ -50,6 +52,8 @@ async fn main() {
 async fn run(target: &str, protocol: &str) -> Result<()> {
     let target_ip = to_ipaddr(target)?;
     let protocol = protocol.parse::<TracerouteProtocol>()?;
+
+    info!("traceroute for {} using {:?}", target_ip, protocol);
 
     let semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_FLIGHT));
 
@@ -72,17 +76,21 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     let responses = Arc::new(Mutex::new(responses));
 
     let printer = tokio::spawn(print_results(responses.clone(), rx1, tx2));
+    info!("printer: spawned");
+
     let receiver = tokio::spawn(receive(
         semaphore.clone(),
         timetable.clone(),
         tx1.clone(),
         rx2,
     ));
+    info!("receiver: spawned");
 
     let mut tasks = vec![];
 
-    for _ in 0..u8::MAX {
+    for n in 0..u8::MAX {
         tasks.push(tokio::spawn(trace(
+            n,
             tx1.clone(),
             responses.clone(),
             target_ip,
@@ -91,20 +99,27 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
             ttl.clone(),
             timetable.clone(),
         )));
+        info!("tracer {}: spawned", n);
     }
 
-    for task in tasks {
+    for (n, task) in tasks.into_iter().enumerate() {
+        info!("awaiting task {}", n);
         task.await??;
     }
+    info!("awaited all tasks");
+
+    receiver.await??;
+    info!("awaited receiver");
 
     printer.await??;
-    receiver.await??;
+    info!("awaited printer");
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn trace(
+    n: u8,
     tx1: mpsc::Sender<Message>,
     responses: Arc<Mutex<[Option<Message>; u8::MAX as usize]>>,
     target: Ipv4Addr,
@@ -116,33 +131,53 @@ async fn trace(
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
      * We are limiting the number of tasks in flight so we don't end up
      * sending more packets than needed by spawning too many tasks. */
-
+    info!("tracer {} wants to acquire the semaphore", n);
     if let Ok(permit) = semaphore.acquire().await {
         /* Each task increments the TTL and sends a probe. */
+        info!("tracer {} successfully acquired the semaphore", n);
+
         let ttl = {
             let mut counter = ttl.lock().await;
             *counter += 1;
             *counter
         };
 
-        for _ in 0..3 {
+        for numprobe in 0..3 {
+            info!(
+                "tracer {} probing ttl {} for the {}. time",
+                n, ttl, numprobe
+            );
             send_probe(target, protocol, ttl, timetable.clone()).await?;
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            info!(
+                "tracer {} probing ttl {} for the {}. time slept 100ms",
+                n, ttl, numprobe
+            );
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        info!("tracer {} slept 3 secs", n);
 
         /* Marking the response as not received. */
 
         {
             let guard = { responses.lock().await };
+            info!("tracer {} thinks ttl {} timed out", n, ttl);
             if guard[ttl as usize - 1].is_none() {
-                tx1.send(Message::Timeout(ttl)).await?;
+                info!("tracer {}: ttl {} definitely timed out", n, ttl);
+                if tx1.send(Message::Timeout(ttl)).await.is_err() {
+                    info!("tracer {}: error sending to printer", n);
+                    return Ok(());
+                }
             }
         }
 
+        info!("tracer {}: forgetting the permit", n);
         permit.forget();
     }
 
+    info!("tracer {}: exiting", n);
     Ok(())
 }
 
@@ -207,11 +242,30 @@ async fn receive(
     tx1: mpsc::Sender<Message>,
     mut rx2: mpsc::Receiver<Message>,
 ) -> Result<()> {
+    info!("receiver: spawned");
     let recv_sock = create_sock()?;
     let mut recv_buf = [0u8; 576];
-
+    let mut recvd = HashSet::new();
     loop {
+        if let Ok(Message::BreakReceiver) = rx2.try_recv() {
+            info!("receiver: got BreakReceiver, closing the semaphore and breaking");
+            semaphore.close();
+            break;
+        }
+
         let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
+
+        if !recvd.contains(&ip_addr) {
+            info!("receiver: received from unique ip_addr: {}", ip_addr);
+            recvd.insert(ip_addr);
+        } else {
+            info!(
+                "receiver: received from duplicate ip_addr: {} -- back to the top of the loop",
+                ip_addr
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
 
         let icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
             Some(packet) => packet,
@@ -227,6 +281,7 @@ async fn receive(
         };
 
         let hop = original_ipv4_packet.get_identification() as u8;
+        info!("receiver: extracted hop {}", hop);
 
         let hostname =
             tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.ip())).await??;
@@ -235,47 +290,38 @@ async fn receive(
             IcmpTypes::TimeExceeded => {
                 let rtt = time_for_hop(&timetable, hop).await?;
 
-                println!("sending TimeExceeded for {}", hop);
-
+                info!("receiver: sending TimeExceeded for hop {}", hop);
                 tx1.send(Message::TimeExceeded((hop, hostname, ip_addr, rtt)))
                     .await?;
 
+                info!("receiver: added one more permit");
                 /* Allow one more task to go through. */
                 semaphore.add_permits(1);
             }
             IcmpTypes::EchoReply => {
-                let rtt = time_for_hop(&timetable, hop).await?;
+                let rtt = time_for_hop(&timetable, hop + 1).await?;
 
-                tx1.send(Message::EchoReply((hop, hostname, ip_addr, rtt)))
+                info!("receiver: sending EchoReply for hop {}", hop + 1);
+                tx1.send(Message::EchoReply((hop + 1, hostname, ip_addr, rtt)))
                     .await?;
-
-                if let Ok(Message::BreakReceiver) = rx2.try_recv() {
-                    println!("closed semaphore, breking");
-                    semaphore.close();
-                    break Ok(());
-                }
             }
             IcmpTypes::DestinationUnreachable => {
                 let rtt = time_for_hop(&timetable, hop).await?;
                 let code = icmp_packet.get_icmp_code();
 
+                info!("receiver: sending DestinationUnreachable for hop {}", hop);
                 tx1.send(Message::DestinationUnreachable(
                     (hop, hostname, ip_addr, rtt),
                     code,
                 ))
                 .await?;
-
-                // println!("waiting for BreakReceiver");
-
-                if let Ok(Message::BreakReceiver) = rx2.try_recv() {
-                    println!("closed semaphore, breking");
-                    semaphore.close();
-                    break Ok(());
-                }
             }
             _ => {}
         }
     }
+    info!("receiver: exiting");
+
+    Ok(())
 }
 
 async fn print_results(
@@ -283,6 +329,7 @@ async fn print_results(
     mut rx1: mpsc::Receiver<Message>,
     tx2: mpsc::Sender<Message>,
 ) -> Result<()> {
+    info!("printer: spawned");
     /* The printer awaits messages from the receiver. Sometimes, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
@@ -301,6 +348,7 @@ async fn print_results(
                         ip_addr,
                         time,
                     )));
+                    info!("printer: got TimeExceeded for hop {}", hop);
                 }
             }
             Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
@@ -309,30 +357,30 @@ async fn print_results(
                         (hop, hostname.clone(), ip_addr, time),
                         code,
                     ));
+                    info!("printer: got DestinationUnreachable for hop {}", hop);
 
                     final_hop = hop;
-                    println!("setting final_hop to {}", hop);
+                    info!("printer: set final_hop to {}", final_hop);
                 }
             }
             Message::EchoReply((hop, hostname, ip_addr, time)) => {
                 if rguard[hop as usize - 1].is_none() {
                     rguard[hop as usize - 1] =
                         Some(Message::EchoReply((hop, hostname.clone(), ip_addr, time)));
+                    info!("printer: got EchoReply for hop {}", hop);
+
                     final_hop = hop;
+                    info!("printer: set final_hop to {}", final_hop);
                 }
             }
             Message::Timeout(hop) => {
                 if rguard[hop as usize - 1].is_none() {
                     rguard[hop as usize - 1] = Some(Message::Timeout(hop));
+                    info!("printer: got Timeout for hop {}", hop);
                 }
             }
             _ => {}
         }
-
-        println!(
-            "responses[last_printed]: {:?} -- last_printed: {}",
-            rguard[last_printed as usize], last_printed
-        );
 
         while last_printed < u8::MAX && rguard[last_printed as usize].is_some() {
             if let Some(response) = rguard[last_printed as usize].clone() {
@@ -345,7 +393,7 @@ async fn print_results(
                         }
                     }
                     Message::Timeout(hop) => {
-                        println!("{}:  *** ", hop);
+                        println!("timeout {}:  *** ", hop);
                         last_printed += 1;
                     }
                     Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
@@ -356,7 +404,6 @@ async fn print_results(
                             );
                             all_printed.insert((hop, ip_addr));
                             last_printed += 1;
-                            println!("setting final hop to: {}", hop);
                         }
                     }
                     Message::EchoReply((hop, hostname, ip_addr, time)) => {
@@ -375,12 +422,16 @@ async fn print_results(
             }
 
             if last_printed == final_hop {
-                println!("sending BreakReceiver");
+                info!(
+                    "printer: printed final_hop ({}), sending BreakReceiver and breaking",
+                    final_hop
+                );
                 tx2.send(Message::BreakReceiver).await?;
                 break 'mainloop;
             }
         }
     }
+
     Ok(())
 }
 
@@ -464,7 +515,7 @@ async fn time_for_hop(timetable: &Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> 
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 enum TracerouteProtocol {
     Icmp,
     Udp,
