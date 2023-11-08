@@ -272,17 +272,18 @@ async fn receive(
             None => bail!("couldn't make icmp packet"),
         };
 
-        /* A part of the original IPv4 packet (header + at least first 8 bytes)
-         * is contained in an ICMP error message. We use the identification fi-
-         * eld to map responses back to correct hops. */
-        let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..]) {
-            Some(packet) => packet,
-            None => bail!("couldn't make ivp4 packet"),
-        };
-
         let hop = if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
             id_from_payload(icmp_packet.payload())
         } else {
+            /* A part of the original IPv4 packet (header + at least first 8 bytes)
+             * is contained in an ICMP error message. We use the identification fi-
+             * eld to map responses back to correct hops. */
+            let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..])
+            {
+                Some(packet) => packet,
+                None => bail!("couldn't make ivp4 packet"),
+            };
+
             original_ipv4_packet.get_identification()
         } as u8;
 
@@ -505,7 +506,7 @@ fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
 }
 
 fn id_from_payload(payload: &[u8]) -> u16 {
-    let identifier = &payload[0..4];
+    let identifier = &payload[0..2];
     let mut id = identifier[0] as u16;
     id <<= 8;
     id |= identifier[1] as u16;
