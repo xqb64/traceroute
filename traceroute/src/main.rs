@@ -16,13 +16,13 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use structopt::StructOpt;
 use tokio::{
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Mutex, Semaphore,
+        Semaphore,
     },
     time::{Duration, Instant},
 };
@@ -139,7 +139,7 @@ async fn trace(
         info!("tracer {} successfully acquired the semaphore", n);
 
         let ttl = {
-            let mut counter = ttl.lock().await;
+            let mut counter = ttl.lock().unwrap();
             *counter += 1;
             *counter
         };
@@ -157,14 +157,15 @@ async fn trace(
             /* Marking the response as not received. */
 
             {
-                let guard = { responses.lock().await };
-
                 info!("tracer {} thinks ttl {} timed out", n, ttl);
 
-                let msg = guard[ttl as usize - 1].as_ref();
+                let msg = {
+                    let guard = { responses.lock().unwrap() };
+                    guard[ttl as usize - 1].clone()
+                };
+
                 if msg.is_none() || msg.is_some_and(|msg| msg.is_timeout()) {
                     info!("tracer {}: ttl {} definitely timed out", n, ttl);
-
                     if tx1.send(Message::Timeout(ttl, numprobe + 1)).await.is_err() {
                         info!("tracer {}: error sending to printer", n);
                         return Ok(());
@@ -231,7 +232,7 @@ async fn send_probe(
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
     sock.send_to(ipv4_packet.packet(), (target, 33434)).await?;
 
-    timetable.lock().await.insert(ttl, Instant::now());
+    timetable.lock().unwrap().insert(ttl, Instant::now());
 
     Ok(())
 }
@@ -342,7 +343,7 @@ async fn print_results(
     let mut all_printed = HashSet::new();
 
     'mainloop: while let Some(msg) = rx1.recv().await {
-        let mut rguard = { responses.lock().await };
+        let mut rguard = { responses.lock().unwrap() };
         match msg {
             Message::TimeExceeded((hop, _, _, _)) => {
                 if rguard[hop as usize - 1].is_none() {
@@ -427,13 +428,13 @@ async fn print_results(
 
             if last_printed == final_hop {
                 info!("printer: printed final_hop ({})", final_hop);
-                tx2.send(Message::BreakReceiver).await?;
-
-                info!("printer: sent BreakReceiver");
                 break 'mainloop;
             }
         }
     }
+
+    tx2.send(Message::BreakReceiver).await?;
+    info!("printer: sent BreakReceiver");
 
     info!("printer: exiting");
     Ok(())
@@ -521,7 +522,7 @@ fn create_sock() -> Result<Arc<RawSocket>> {
 }
 
 async fn time_for_hop(timetable: &Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> Result<Duration> {
-    match timetable.lock().await.get(&hop) {
+    match timetable.lock().unwrap().get(&hop) {
         Some(time) => Ok(Instant::now().duration_since(*time)),
         None => bail!("did not find time {} in the timetable", hop),
     }
