@@ -194,21 +194,10 @@ async fn send_probe(
         Protocol::from(IPPROTO_RAW).into(),
     )?;
 
-    let (ip_next_hdr_protocol, ip_next_hdr_len, mut ipv4_buf, mut ip_next_hdr_buf) = match protocol
-    {
-        TracerouteProtocol::Udp => (
-            IpNextHeaderProtocols::Udp,
-            UDP_HDR_LEN,
-            vec![0u8; IP_HDR_LEN + UDP_HDR_LEN],
-            vec![0u8; UDP_HDR_LEN],
-        ),
-        TracerouteProtocol::Icmp => (
-            IpNextHeaderProtocols::Icmp,
-            ICMP_HDR_LEN,
-            vec![0u8; IP_HDR_LEN + ICMP_HDR_LEN],
-            vec![0u8; ICMP_HDR_LEN],
-        ),
-    };
+    let mut ipv4_buf = protocol.get_ipv4_buffer();
+    let ip_next_hdr_len = protocol.get_next_header_length();
+    let mut ip_next_hdr_buf = protocol.get_ipv4_next_header_buffer();
+    let ip_next_hdr_protocol = protocol.get_next_header_protocol();
 
     let mut ipv4_packet = build_ipv4_packet(
         &mut ipv4_buf,
@@ -218,15 +207,8 @@ async fn send_probe(
         ip_next_hdr_protocol,
     );
 
-    let next_packet = match protocol {
-        TracerouteProtocol::Udp => build_udp_packet(&mut ip_next_hdr_buf),
-        TracerouteProtocol::Icmp => build_icmp_packet(&mut ip_next_hdr_buf, ttl as u16),
-    };
-
-    match next_packet {
-        NextPacket::Icmp(packet) => ipv4_packet.set_payload(packet.packet()),
-        NextPacket::Udp(packet) => ipv4_packet.set_payload(packet.packet()),
-    };
+    let next_packet = protocol.build_next_packet(&mut ip_next_hdr_buf, ttl);
+    ipv4_packet.set_payload(next_packet.packet());
 
     sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &1i32)?;
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
@@ -534,6 +516,43 @@ enum TracerouteProtocol {
     Udp,
 }
 
+impl TracerouteProtocol {
+    fn get_ipv4_buffer(&self) -> Vec<u8> {
+        match self {
+            TracerouteProtocol::Udp => vec![0u8; IP_HDR_LEN + UDP_HDR_LEN],
+            TracerouteProtocol::Icmp => vec![0u8; IP_HDR_LEN + ICMP_HDR_LEN],
+        }
+    }
+
+    fn get_ipv4_next_header_buffer(&self) -> Vec<u8> {
+        match self {
+            TracerouteProtocol::Udp => vec![0u8; UDP_HDR_LEN],
+            TracerouteProtocol::Icmp => vec![0u8; ICMP_HDR_LEN],
+        }
+    }
+
+    fn get_next_header_length(&self) -> usize {
+        match self {
+            TracerouteProtocol::Udp => UDP_HDR_LEN,
+            TracerouteProtocol::Icmp => ICMP_HDR_LEN,
+        }
+    }
+
+    fn get_next_header_protocol(&self) -> IpNextHeaderProtocol {
+        match self {
+            TracerouteProtocol::Udp => IpNextHeaderProtocols::Udp,
+            TracerouteProtocol::Icmp => IpNextHeaderProtocols::Icmp,
+        }
+    }
+
+    fn build_next_packet<'a>(&'a self, next_hdr_buf: &'a mut [u8], ttl: u8) -> NextPacket {
+        match self {
+            TracerouteProtocol::Udp => build_udp_packet(next_hdr_buf),
+            TracerouteProtocol::Icmp => build_icmp_packet(next_hdr_buf, ttl as u16),
+        }
+    }
+}
+
 impl FromStr for TracerouteProtocol {
     type Err = anyhow::Error;
 
@@ -549,6 +568,15 @@ impl FromStr for TracerouteProtocol {
 enum NextPacket<'a> {
     Udp(MutableUdpPacket<'a>),
     Icmp(MutableEchoRequestPacket<'a>),
+}
+
+impl<'a> NextPacket<'a> {
+    fn packet(&self) -> &[u8] {
+        match self {
+            NextPacket::Udp(packet) => packet.packet(),
+            NextPacket::Icmp(packet) => packet.packet(),
+        }
+    }
 }
 
 type Payload = (u8, String, SocketAddr, Duration);
