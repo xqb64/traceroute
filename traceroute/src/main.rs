@@ -13,6 +13,7 @@ use raw_socket::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -20,7 +21,7 @@ use std::{
 use structopt::StructOpt;
 use tokio::{
     sync::{
-        mpsc::{self},
+        mpsc::{channel, Receiver, Sender},
         Mutex, Semaphore,
     },
     time::{Duration, Instant},
@@ -41,6 +42,7 @@ const IPPROTO_RAW: i32 = 255;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
     let opt = Opt::from_args();
     let result = run(&opt.target, &opt.protocol).await;
 
@@ -63,9 +65,9 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     let ttl = Arc::new(Mutex::new(START_TTL));
     let timetable = Arc::new(Mutex::new(HashMap::new()));
 
-    /* Memory channel for communicating between the printer and the receiver. */
-    let (tx1, rx1) = mpsc::channel(256);
-    let (tx2, rx2) = mpsc::channel(2);
+    /* Memory channels for communicating between the printer and the receiver. */
+    let (tx1, rx1) = channel(256);
+    let (tx2, rx2) = channel(2);
 
     let responses: [Option<Message>; u8::MAX as usize] = std::iter::repeat(None)
         .take(u8::MAX as usize)
@@ -120,7 +122,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn trace(
     n: u8,
-    tx1: mpsc::Sender<Message>,
+    tx1: Sender<Message>,
     responses: Arc<Mutex<[Option<Message>; u8::MAX as usize]>>,
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
@@ -149,26 +151,24 @@ async fn trace(
             );
             send_probe(target, protocol, ttl, timetable.clone()).await?;
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            info!(
-                "tracer {} probing ttl {} for the {}. time slept 100ms",
-                n, ttl, numprobe
-            );
-        }
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            info!("tracer {} slept 3 secs", n);
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        info!("tracer {} slept 3 secs", n);
+            /* Marking the response as not received. */
 
-        /* Marking the response as not received. */
+            {
+                let guard = { responses.lock().await };
 
-        {
-            let guard = { responses.lock().await };
-            info!("tracer {} thinks ttl {} timed out", n, ttl);
-            if guard[ttl as usize - 1].is_none() {
-                info!("tracer {}: ttl {} definitely timed out", n, ttl);
-                if tx1.send(Message::Timeout(ttl)).await.is_err() {
-                    info!("tracer {}: error sending to printer", n);
-                    return Ok(());
+                info!("tracer {} thinks ttl {} timed out", n, ttl);
+
+                let msg = guard[ttl as usize - 1].as_ref();
+                if msg.is_none() || msg.is_some_and(|msg| msg.is_timeout()) {
+                    info!("tracer {}: ttl {} definitely timed out", n, ttl);
+
+                    if tx1.send(Message::Timeout(ttl, numprobe + 1)).await.is_err() {
+                        info!("tracer {}: error sending to printer", n);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -239,8 +239,8 @@ async fn send_probe(
 async fn receive(
     semaphore: Arc<Semaphore>,
     timetable: Arc<Mutex<HashMap<u8, Instant>>>,
-    tx1: mpsc::Sender<Message>,
-    mut rx2: mpsc::Receiver<Message>,
+    tx1: Sender<Message>,
+    mut rx2: Receiver<Message>,
 ) -> Result<()> {
     info!("receiver: inside");
     let recv_sock = create_sock()?;
@@ -330,8 +330,8 @@ async fn receive(
 
 async fn print_results(
     responses: Arc<Mutex<[Option<Message>; u8::MAX as usize]>>,
-    mut rx1: mpsc::Receiver<Message>,
-    tx2: mpsc::Sender<Message>,
+    mut rx1: Receiver<Message>,
+    tx2: Sender<Message>,
 ) -> Result<()> {
     info!("printer: inside");
     /* The printer awaits messages from the receiver. Sometimes, the messages
@@ -368,10 +368,23 @@ async fn print_results(
                     info!("printer: set final_hop to {}", final_hop);
                 }
             }
-            Message::Timeout(hop) => {
-                if rguard[hop as usize - 1].is_none() {
+            Message::Timeout(hop, numprobe) => {
+                info!("printer: got Timeout for hop {}", hop);
+
+                if hop == last_printed + 1 {
+                    if numprobe == 1 {
+                        print!("{}: ", hop);
+                        print!("* ");
+                        std::io::stdout().flush()?;
+                    } else if numprobe > 1 && numprobe < 3 {
+                        print!("* ");
+                        std::io::stdout().flush()?;
+                    } else if numprobe == 3 {
+                        println!("*");
+                        last_printed += 1;
+                    }
+                } else if rguard[hop as usize - 1].is_none() {
                     rguard[hop as usize - 1] = Some(msg);
-                    info!("printer: got Timeout for hop {}", hop);
                 }
             }
             _ => {}
@@ -386,10 +399,6 @@ async fn print_results(
                             all_printed.insert((hop, ip_addr));
                             last_printed += 1;
                         }
-                    }
-                    Message::Timeout(hop) => {
-                        println!("{}:  *** ", hop);
-                        last_printed += 1;
                     }
                     Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
                         if !all_printed.contains(&(hop, ip_addr)) {
@@ -548,8 +557,14 @@ enum Message {
     TimeExceeded(Payload),
     DestinationUnreachable(Payload, IcmpCode),
     EchoReply(Payload),
-    Timeout(u8),
+    Timeout(u8, usize),
     BreakReceiver,
+}
+
+impl Message {
+    fn is_timeout(&self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(&Message::Timeout(0, 0))
+    }
 }
 
 #[derive(Debug, StructOpt)]
