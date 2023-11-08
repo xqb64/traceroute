@@ -242,7 +242,7 @@ async fn receive(
     tx1: mpsc::Sender<Message>,
     mut rx2: mpsc::Receiver<Message>,
 ) -> Result<()> {
-    info!("receiver: spawned");
+    info!("receiver: inside");
     let recv_sock = create_sock()?;
     let mut recv_buf = [0u8; 576];
     let mut recvd = HashSet::new();
@@ -333,7 +333,7 @@ async fn print_results(
     mut rx1: mpsc::Receiver<Message>,
     tx2: mpsc::Sender<Message>,
 ) -> Result<()> {
-    info!("printer: spawned");
+    info!("printer: inside");
     /* The printer awaits messages from the receiver. Sometimes, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
