@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use libc::{getnameinfo, sockaddr, sockaddr_in, socklen_t, NI_MAXHOST};
 use pnet::packet::{
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
     ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
@@ -14,7 +15,7 @@ use raw_socket::{
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -26,7 +27,7 @@ use tokio::{
     },
     time::{Duration, Instant},
 };
-use tracing::info;
+use tracing::{error, info};
 
 const START_TTL: u8 = 0;
 const MAX_TASKS_IN_FLIGHT: usize = 4;
@@ -38,6 +39,7 @@ const UDP_HDR_LEN: usize = 8;
 const TRACEROUTE_PORT: usize = 33434;
 
 const IPPROTO_RAW: i32 = 255;
+const NI_IDN: i32 = 0;
 
 #[tokio::main]
 async fn main() {
@@ -64,12 +66,13 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
      * the TTL simultaneously. */
     let ttl = Arc::new(Mutex::new(START_TTL));
     let timetable = Arc::new(Mutex::new(HashMap::new()));
+    let id_table = Arc::new(Mutex::new(HashMap::new()));
 
     /* Memory channels for communicating between the printer and the receiver. */
-    let (tx1, rx1) = channel(256);
+    let (tx1, rx1) = channel(1024);
     let (tx2, rx2) = channel(2);
 
-    let responses: [Option<Message>; u8::MAX as usize] = std::iter::repeat(None)
+    let responses: [Vec<Message>; u8::MAX as usize] = std::iter::repeat(Vec::new())
         .take(u8::MAX as usize)
         .collect::<Vec<_>>()
         .try_into()
@@ -77,12 +80,13 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
 
     let responses = Arc::new(Mutex::new(responses));
 
-    let printer = tokio::spawn(print_results(responses.clone(), rx1, tx2));
+    let printer = tokio::spawn(print_results(responses.clone(), id_table.clone(), rx1, tx2));
     info!("printer: spawned");
 
     let receiver = tokio::spawn(receive(
         semaphore.clone(),
         timetable.clone(),
+        id_table.clone(),
         tx1.clone(),
         rx2,
     ));
@@ -95,6 +99,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
             n,
             tx1.clone(),
             responses.clone(),
+            id_table.clone(),
             target_ip,
             protocol,
             semaphore.clone(),
@@ -123,12 +128,13 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
 async fn trace(
     n: u8,
     tx1: Sender<Message>,
-    responses: Arc<Mutex<[Option<Message>; u8::MAX as usize]>>,
+    responses: Arc<Mutex<[Vec<Message>; u8::MAX as usize]>>,
+    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
     semaphore: Arc<Semaphore>,
     ttl: Arc<Mutex<u8>>,
-    timetable: Arc<Mutex<HashMap<u8, Instant>>>,
+    timetable: Arc<Mutex<HashMap<u16, Instant>>>,
 ) -> Result<()> {
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
      * We are limiting the number of tasks in flight so we don't end up
@@ -147,27 +153,51 @@ async fn trace(
         for numprobe in 0..3 {
             info!(
                 "tracer {} probing ttl {} for the {}. time",
-                n, ttl, numprobe
+                n,
+                ttl,
+                numprobe + 1
             );
-            send_probe(target, protocol, ttl, timetable.clone()).await?;
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            info!("tracer {} slept 3 secs", n);
+            // println!("send_probe: ttl {} numprobe {}", ttl, numprobe + 1);
+            send_probe(
+                target,
+                protocol,
+                ttl,
+                numprobe + 1,
+                timetable.clone(),
+                id_table.clone(),
+            )
+            .await?;
 
             /* Marking the response as not received. */
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
             {
-                info!("tracer {} thinks ttl {} timed out", n, ttl);
+                info!(
+                    "tracer {} thinks ttl {} numprobe {} timed out",
+                    n,
+                    ttl,
+                    numprobe + 1
+                );
 
-                let msg = {
+                let response = {
                     let guard = { responses.lock().unwrap() };
-                    guard[ttl as usize - 1].clone()
+                    guard[ttl as usize - 1].get(numprobe).cloned()
                 };
 
-                if msg.is_none() || msg.is_some_and(|msg| msg.is_timeout()) {
+                if response.is_none() {
                     info!("tracer {}: ttl {} definitely timed out", n, ttl);
-                    if tx1.send(Message::Timeout(ttl, numprobe + 1)).await.is_err() {
-                        info!("tracer {}: error sending to printer", n);
+                    if tx1
+                        .send(Message::Timeout(Payload {
+                            id: ttl as u16,
+                            numprobe: numprobe + 1,
+                            hostname: None,
+                            ip_addr: None,
+                            rtt: None,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        semaphore.close();
                         return Ok(());
                     }
                 }
@@ -175,7 +205,7 @@ async fn trace(
         }
 
         info!("tracer {}: forgetting the permit", n);
-        permit.forget();
+        drop(permit);
     }
 
     info!("tracer {}: exiting", n);
@@ -186,7 +216,9 @@ async fn send_probe(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
     ttl: u8,
-    timetable: Arc<Mutex<HashMap<u8, Instant>>>,
+    numprobe: usize,
+    timetable: Arc<Mutex<HashMap<u16, Instant>>>,
+    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
 ) -> Result<()> {
     let sock = RawSocket::new(
         Domain::ipv4(),
@@ -198,30 +230,38 @@ async fn send_probe(
     let ip_next_hdr_len = protocol.get_next_header_length();
     let mut ip_next_hdr_buf = protocol.get_ipv4_next_header_buffer();
     let ip_next_hdr_protocol = protocol.get_next_header_protocol();
+    let id = rand::random::<u16>();
+
+    {
+        let mut guard = id_table.lock().unwrap();
+        guard.insert(id, (ttl, numprobe));
+    }
 
     let mut ipv4_packet = build_ipv4_packet(
         &mut ipv4_buf,
         target,
         (IP_HDR_LEN + ip_next_hdr_len) as u16,
         ttl,
+        id,
         ip_next_hdr_protocol,
     );
 
-    let next_packet = protocol.build_next_packet(&mut ip_next_hdr_buf, ttl);
+    let next_packet = protocol.build_next_packet(&mut ip_next_hdr_buf, id);
     ipv4_packet.set_payload(next_packet.packet());
 
     sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &1i32)?;
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
     sock.send_to(ipv4_packet.packet(), (target, 33434)).await?;
 
-    timetable.lock().unwrap().insert(ttl, Instant::now());
+    timetable.lock().unwrap().insert(id as u16, Instant::now());
 
     Ok(())
 }
 
 async fn receive(
     semaphore: Arc<Semaphore>,
-    timetable: Arc<Mutex<HashMap<u8, Instant>>>,
+    timetable: Arc<Mutex<HashMap<u16, Instant>>>,
+    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
     tx1: Sender<Message>,
     mut rx2: Receiver<Message>,
 ) -> Result<()> {
@@ -229,33 +269,22 @@ async fn receive(
     let recv_sock = create_sock()?;
     let mut recv_buf = [0u8; 576];
     let mut recvd = HashSet::new();
+    let mut dns_cache = HashMap::new();
+
     loop {
         if let Ok(Message::BreakReceiver) = rx2.try_recv() {
             info!("receiver: got BreakReceiver, closing the semaphore and breaking");
-            semaphore.close();
             break;
         }
 
         let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
-
-        if !recvd.contains(&ip_addr) {
-            info!("receiver: received from unique ip_addr: {}", ip_addr);
-            recvd.insert(ip_addr);
-        } else {
-            info!(
-                "receiver: received from duplicate ip_addr: {} -- back to the top of the loop",
-                ip_addr
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
 
         let icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
             Some(packet) => packet,
             None => bail!("couldn't make icmp packet"),
         };
 
-        let hop = if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
+        let id = if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
             id_from_payload(icmp_packet.payload())
         } else {
             /* A part of the original IPv4 packet (header + at least first 8 bytes)
@@ -268,40 +297,84 @@ async fn receive(
             };
 
             original_ipv4_packet.get_identification()
-        } as u8;
+        };
 
-        let hostname =
-            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr.ip())).await??;
+        let rtt = time_for_id(&timetable, id).await?;
+
+        if !recvd.contains(&id) {
+            recvd.insert(id);
+        } else {
+            println!("receiving duplicates");
+            continue;
+        }
+
+        let hostname = dns_cache
+            .entry(ip_addr)
+            .or_insert(match reverse_dns_lookup(ip_addr).await {
+                Ok(host) => host,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    panic!("spam");
+                }
+            })
+            .clone();
 
         match icmp_packet.get_icmp_type() {
             IcmpTypes::TimeExceeded => {
-                let rtt = time_for_hop(&timetable, hop).await?;
+                let numprobe = numprobe_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending TimeExceeded for hop {}", hop);
-                tx1.send(Message::TimeExceeded((hop, hostname, ip_addr, rtt)))
-                    .await?;
+                if tx1
+                    .send(Message::TimeExceeded(Payload {
+                        id,
+                        numprobe,
+                        hostname: Some(hostname),
+                        ip_addr: Some(ip_addr),
+                        rtt: Some(rtt),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
 
-                info!("receiver: added one more permit");
-                /* Allow one more task to go through. */
                 semaphore.add_permits(1);
+                info!("receiver: added one more permit");
             }
             IcmpTypes::EchoReply => {
-                let rtt = time_for_hop(&timetable, hop).await?;
+                let numprobe = numprobe_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending EchoReply for hop {}", hop);
-                tx1.send(Message::EchoReply((hop, hostname, ip_addr, rtt)))
-                    .await?;
+                info!("receiver: sending EchoReply for hop {}", id);
+                if tx1
+                    .send(Message::EchoReply(Payload {
+                        id,
+                        numprobe,
+                        hostname: Some(hostname),
+                        ip_addr: Some(ip_addr),
+                        rtt: Some(rtt),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             IcmpTypes::DestinationUnreachable => {
-                let rtt = time_for_hop(&timetable, hop).await?;
-                let code = icmp_packet.get_icmp_code();
+                let numprobe = numprobe_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending DestinationUnreachable for hop {}", hop);
-                tx1.send(Message::DestinationUnreachable(
-                    (hop, hostname, ip_addr, rtt),
-                    code,
-                ))
-                .await?;
+                info!("receiver: sending DestinationUnreachable for hop {}", id);
+                if tx1
+                    .send(Message::DestinationUnreachable(Payload {
+                        id,
+                        numprobe,
+                        hostname: Some(hostname),
+                        ip_addr: Some(ip_addr),
+                        rtt: Some(rtt),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             _ => {}
         }
@@ -311,8 +384,125 @@ async fn receive(
     Ok(())
 }
 
+async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
+    let ip = match ip_addr {
+        SocketAddr::V4(ipv4_addr) => *ipv4_addr.ip(),
+        SocketAddr::V6(_) => bail!("not implemented for ipv6"),
+    };
+    let sockaddr = SocketAddrV4::new(ip, 0);
+    let sockaddr_in = sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(sockaddr.ip().octets()),
+        },
+        sin_zero: [0; 8],
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut host = [0 as libc::c_char; NI_MAXHOST as usize];
+
+        let ret = unsafe {
+            getnameinfo(
+                &sockaddr_in as *const _ as *const sockaddr,
+                std::mem::size_of::<sockaddr_in>() as socklen_t,
+                host.as_mut_ptr(),
+                host.len() as socklen_t,
+                std::ptr::null_mut(),
+                0,
+                NI_IDN,
+            )
+        };
+
+        if ret != 0 {
+            error!("getnameinfo for {} failed: {}", ip, ret);
+            bail!("getnameinfo for {} failed: {}", ip, ret);
+        }
+
+        let c_str = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
+        Ok(c_str.to_str()?.to_string())
+    })
+    .await
+    .unwrap()
+}
+fn hop_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16) -> Result<u8> {
+    if let Some(&entry) = id_table.lock().unwrap().get(&id) {
+        Ok(entry.0)
+    } else {
+        bail!("id {} not found", id);
+    }
+}
+
+fn numprobe_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16) -> Result<usize> {
+    if let Some(&entry) = id_table.lock().unwrap().get(&id) {
+        Ok(entry.1)
+    } else {
+        bail!("id {} not found", id);
+    }
+}
+
+fn sort(v: &mut [Message]) {
+    v.sort_by(|a, b| {
+        let numprobe_a = match a {
+            Message::TimeExceeded(payload)
+            | Message::DestinationUnreachable(payload)
+            | Message::EchoReply(payload) => payload.numprobe,
+            Message::Timeout(payload) => payload.numprobe,
+            _ => 0, // Handle non-Payload messages as needed
+        };
+        let numprobe_b = match b {
+            Message::TimeExceeded(payload)
+            | Message::DestinationUnreachable(payload)
+            | Message::EchoReply(payload) => payload.numprobe,
+            Message::Timeout(payload) => payload.numprobe,
+            _ => 0, // Handle non-Payload messages as needed
+        };
+        numprobe_b.cmp(&numprobe_a)
+    });
+}
+
+macro_rules! print_probe {
+    ($payload:expr, $hop:expr, $expected_numprobe:expr, $last_printed:expr, $mainloop:lifetime) => {{
+        if $hop == $last_printed + 1 && $payload.numprobe == *$expected_numprobe {
+            if $payload.numprobe == 1 {
+                if $payload.hostname.is_some() {
+                    print!(
+                        "{}: {} ({}) - {:?} ",
+                        $hop, $payload.hostname.unwrap(), $payload.ip_addr.unwrap(), $payload.rtt.unwrap()
+                    );
+                } else {
+                    print!("{}: ", $hop);
+                    print!("* ");
+                }
+                std::io::stdout().flush()?;
+                *$expected_numprobe += 1;
+
+                continue $mainloop;
+            } else if $payload.numprobe > 1 && $payload.numprobe < 3 {
+                if $payload.rtt.is_some() {
+                    print!("- {:?} ", $payload.rtt.unwrap());
+                } else {
+                    print!("* ");
+                }
+                std::io::stdout().flush()?;
+                *$expected_numprobe += 1;
+
+                continue $mainloop;
+            } else if $payload.numprobe == 3 {
+                if $payload.rtt.is_some() {
+                    println!("- {:?}", $payload.rtt.unwrap());
+                } else {
+                    println!("*");
+                }
+                $last_printed += 1;
+            }
+        }
+    }};
+}
+
 async fn print_results(
-    responses: Arc<Mutex<[Option<Message>; u8::MAX as usize]>>,
+    responses: Arc<Mutex<[Vec<Message>; u8::MAX as usize]>>,
+    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
     mut rx1: Receiver<Message>,
     tx2: Sender<Message>,
 ) -> Result<()> {
@@ -322,101 +512,93 @@ async fn print_results(
      * the hops in ascending order. */
     let mut last_printed = 0;
     let mut final_hop = 0;
-    let mut all_printed = HashSet::new();
+    let mut expected_numprobes: HashMap<_, _> = (0..255).map(|key| (key, 1)).collect();
 
     'mainloop: while let Some(msg) = rx1.recv().await {
         let mut rguard = { responses.lock().unwrap() };
-        match msg {
-            Message::TimeExceeded((hop, _, _, _)) => {
-                if rguard[hop as usize - 1].is_none() {
-                    rguard[hop as usize - 1] = Some(msg);
-                    info!("printer: got TimeExceeded for hop {}", hop);
-                }
+        match msg.clone() {
+            Message::TimeExceeded(payload) => {
+                let hop = hop_from_id(id_table.clone(), payload.id)?;
+                rguard[hop as usize - 1].push(msg);
+                sort(&mut rguard[hop as usize - 1]);
+                info!("printer: got TimeExceeded for hop {}", hop);
             }
-            Message::DestinationUnreachable((hop, _, _, _), _) => {
-                if rguard[hop as usize - 1].is_none() && final_hop == 0 {
-                    rguard[hop as usize - 1] = Some(msg);
-                    info!("printer: got DestinationUnreachable for hop {}", hop);
+            Message::DestinationUnreachable(payload) => {
+                let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
+                rguard[hop as usize - 1].push(msg);
+                sort(&mut rguard[hop as usize - 1]);
 
+                info!("printer: got DestinationUnreachable for hop {}", hop);
+
+                if final_hop == 0 {
                     final_hop = hop;
                     info!("printer: set final_hop to {}", final_hop);
                 }
             }
-            Message::EchoReply((hop, _, _, _)) => {
-                if rguard[hop as usize - 1].is_none() {
-                    rguard[hop as usize - 1] = Some(msg);
-                    info!("printer: got EchoReply for hop {}", hop);
+            Message::EchoReply(payload) => {
+                let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
 
+                rguard[hop as usize - 1].push(msg);
+                sort(&mut rguard[hop as usize - 1]);
+                info!("printer: got EchoReply for hop {}", hop);
+
+                if final_hop == 0 {
                     final_hop = hop;
                     info!("printer: set final_hop to {}", final_hop);
                 }
             }
-            Message::Timeout(hop, numprobe) => {
-                info!("printer: got Timeout for hop {}", hop);
-
-                if hop == last_printed + 1 {
-                    if numprobe == 1 {
-                        print!("{}: ", hop);
-                        print!("* ");
-                        std::io::stdout().flush()?;
-                    } else if numprobe > 1 && numprobe < 3 {
-                        print!("* ");
-                        std::io::stdout().flush()?;
-                    } else if numprobe == 3 {
-                        println!("*");
-                        last_printed += 1;
-                    }
-                } else if rguard[hop as usize - 1].is_none() {
-                    rguard[hop as usize - 1] = Some(msg);
-                }
+            Message::Timeout(payload) => {
+                info!(
+                    "printer: got Timeout for hop {} numprobe {}",
+                    payload.id, payload.numprobe
+                );
+                rguard[payload.id as usize - 1].push(msg);
+                sort(&mut rguard[payload.id as usize - 1]);
             }
             _ => {}
         }
 
-        while last_printed < u8::MAX && rguard[last_printed as usize].is_some() {
-            if let Some(response) = rguard[last_printed as usize].clone() {
+        while last_printed < u8::MAX && !rguard[last_printed as usize].is_empty() {
+            if let Some(response) = rguard[last_printed as usize].pop() {
                 match response.clone() {
-                    Message::TimeExceeded((hop, hostname, ip_addr, time)) => {
-                        if !all_printed.contains(&(hop, ip_addr)) {
-                            println!("{}: {} ({}) - {:?}", hop, hostname, ip_addr, time);
-                            all_printed.insert((hop, ip_addr));
-                            last_printed += 1;
-                        }
+                    Message::TimeExceeded(payload) => {
+                        let hop = hop_from_id(id_table.clone(), payload.id)?;
+                        let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
+
+                        print_probe!(payload, hop, expected_numprobe, last_printed, 'mainloop);
                     }
-                    Message::DestinationUnreachable((hop, hostname, ip_addr, time), code) => {
-                        if !all_printed.contains(&(hop, ip_addr)) {
-                            println!(
-                                "{}: {} ({}) - {:?} -- destination unreachable ({:?})",
-                                hop, hostname, ip_addr, time, code
-                            );
-                            all_printed.insert((hop, ip_addr));
-                            last_printed += 1;
-                        }
+                    Message::DestinationUnreachable(payload) => {
+                        let hop = hop_from_id(id_table.clone(), payload.id)?;
+                        let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
+
+                        print_probe!(payload, hop, expected_numprobe, last_printed, 'mainloop);
                     }
-                    Message::EchoReply((hop, hostname, ip_addr, time)) => {
-                        if !all_printed.contains(&(hop, ip_addr)) {
-                            println!(
-                                "{}: {} ({}) - {:?} -- echo reply",
-                                hop, hostname, ip_addr, time
-                            );
-                            all_printed.insert((hop, ip_addr));
-                            last_printed += 1;
-                            final_hop = hop;
-                        }
+                    Message::EchoReply(payload) => {
+                        let hop = hop_from_id(id_table.clone(), payload.id)?;
+                        let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
+
+                        print_probe!(payload, hop, expected_numprobe, last_printed, 'mainloop);
+                    }
+                    Message::Timeout(payload) => {
+                        let expected_numprobe =
+                            expected_numprobes.get_mut(&(payload.id as u8)).unwrap();
+
+                        print_probe!(payload, payload.id as u8, expected_numprobe, last_printed, 'mainloop);
                     }
                     _ => {}
                 }
             }
 
-            if last_printed == final_hop {
+            let expected_numprobe = expected_numprobes.get(&final_hop).unwrap();
+            if last_printed != 0 && *expected_numprobe == 3 && last_printed == final_hop {
                 info!("printer: printed final_hop ({})", final_hop);
                 break 'mainloop;
             }
         }
     }
-
-    tx2.send(Message::BreakReceiver).await?;
-    info!("printer: sent BreakReceiver");
+    if tx2.send(Message::BreakReceiver).await.is_ok() {
+        info!("printer: sent BreakReceiver");
+    }
 
     info!("printer: exiting");
     Ok(())
@@ -427,6 +609,7 @@ fn build_ipv4_packet(
     dest: Ipv4Addr,
     size: u16,
     ttl: u8,
+    id: u16,
     next_header: IpNextHeaderProtocol,
 ) -> MutableIpv4Packet {
     use pnet::packet::ipv4::checksum;
@@ -439,7 +622,7 @@ fn build_ipv4_packet(
 
     /* We are setting the identification field to the TTL
      * that we later use to map responses back to correct hops. */
-    packet.set_identification(ttl as u16);
+    packet.set_identification(id);
     packet.set_next_level_protocol(next_header);
     packet.set_destination(dest);
     packet.set_flags(Ipv4Flags::DontFragment);
@@ -449,7 +632,7 @@ fn build_ipv4_packet(
     packet
 }
 
-fn build_icmp_packet(buf: &mut [u8], ttl: u16) -> NextPacket {
+fn build_icmp_packet(buf: &mut [u8], id: u16) -> NextPacket {
     use pnet::packet::icmp::checksum;
 
     let mut packet = MutableEchoRequestPacket::new(buf).unwrap();
@@ -458,7 +641,7 @@ fn build_icmp_packet(buf: &mut [u8], ttl: u16) -> NextPacket {
     packet.set_icmp_type(IcmpTypes::EchoRequest);
     packet.set_icmp_code(IcmpCode::new(0));
     packet.set_sequence_number(seq_no);
-    packet.set_identifier(ttl);
+    packet.set_identifier(id);
     packet.set_checksum(checksum(&IcmpPacket::new(packet.packet()).unwrap()));
 
     NextPacket::Icmp(packet)
@@ -503,10 +686,10 @@ fn create_sock() -> Result<Arc<RawSocket>> {
     }
 }
 
-async fn time_for_hop(timetable: &Arc<Mutex<HashMap<u8, Instant>>>, hop: u8) -> Result<Duration> {
-    match timetable.lock().unwrap().get(&hop) {
+async fn time_for_id(timetable: &Arc<Mutex<HashMap<u16, Instant>>>, id: u16) -> Result<Duration> {
+    match timetable.lock().unwrap().get(&id) {
         Some(time) => Ok(Instant::now().duration_since(*time)),
-        None => bail!("did not find time {} in the timetable", hop),
+        None => bail!("did not find time {} in the timetable", id),
     }
 }
 
@@ -545,10 +728,10 @@ impl TracerouteProtocol {
         }
     }
 
-    fn build_next_packet<'a>(&'a self, next_hdr_buf: &'a mut [u8], ttl: u8) -> NextPacket {
+    fn build_next_packet<'a>(&'a self, next_hdr_buf: &'a mut [u8], id: u16) -> NextPacket {
         match self {
             TracerouteProtocol::Udp => build_udp_packet(next_hdr_buf),
-            TracerouteProtocol::Icmp => build_icmp_packet(next_hdr_buf, ttl as u16),
+            TracerouteProtocol::Icmp => build_icmp_packet(next_hdr_buf, id),
         }
     }
 }
@@ -579,21 +762,22 @@ impl<'a> NextPacket<'a> {
     }
 }
 
-type Payload = (u8, String, SocketAddr, Duration);
+#[derive(Debug, Clone, PartialEq)]
+struct Payload {
+    id: u16,
+    numprobe: usize,
+    hostname: Option<String>,
+    ip_addr: Option<SocketAddr>,
+    rtt: Option<Duration>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Message {
     TimeExceeded(Payload),
-    DestinationUnreachable(Payload, IcmpCode),
+    DestinationUnreachable(Payload),
     EchoReply(Payload),
-    Timeout(u8, usize),
+    Timeout(Payload),
     BreakReceiver,
-}
-
-impl Message {
-    fn is_timeout(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Message::Timeout(0, 0))
-    }
 }
 
 #[derive(Debug, StructOpt)]
