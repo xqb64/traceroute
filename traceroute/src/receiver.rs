@@ -6,6 +6,7 @@ use pnet::packet::{
     ipv4::Ipv4Packet,
     Packet,
 };
+use std::collections::hash_map::Entry;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -14,8 +15,9 @@ use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::Instant,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info, instrument, warn};
 
+#[instrument(skip_all, name = "receiver")]
 pub async fn receive(
     timetable: Arc<Mutex<HashMap<u16, Instant>>>,
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
@@ -27,14 +29,17 @@ pub async fn receive(
     let mut recv_buf = [0u8; 576];
     let mut recvd = HashSet::new();
     let mut dns_cache = HashMap::new();
+    let mut final_hop = 0;
 
     loop {
         if let Ok(Message::BreakReceiver) = rx2.try_recv() {
-            info!("receiver: got BreakReceiver, closing the semaphore and breaking");
+            info!("got BreakReceiver, closing the semaphore and breaking");
             break;
         }
 
         let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
+
+        let time_recvd = Instant::now();
 
         let icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
             Some(packet) => packet,
@@ -59,33 +64,35 @@ pub async fn receive(
         if !recvd.contains(&id) {
             recvd.insert(id);
         } else {
-            info!("receiver: receiving duplicates for {}", id);
+            warn!("receiving duplicates for {id}");
             continue;
         }
 
-        let rtt = time_from_id(&timetable, id).await?;
+        let rtt = time_from_id(&timetable, time_recvd, id).await?;
 
-        let hostname = dns_cache
-            .entry(ip_addr)
-            .or_insert(match reverse_dns_lookup(ip_addr).await {
-                Ok(host) => host,
-                Err(e) => {
-                    error!(
-                        "receiver: error looking up {} -- breaking printer and exiting",
-                        e
-                    );
+        if let Entry::Vacant(e) = dns_cache.entry(ip_addr) {
+            match reverse_dns_lookup(ip_addr).await {
+                Ok(host) => {
+                    debug!(host, "resolving");
+                    e.insert(host); // Insert the new host into the cache
+                }
+                Err(err) => {
+                    error!("error on reverse_dns_lookup ({err})");
+                    warn!("breaking printer and exiting");
                     tx1.send(Message::BreakPrinter).await?;
                     break;
                 }
-            })
-            .clone();
+            }
+        }
+
+        let hostname = dns_cache.get(&ip_addr).unwrap().clone();
 
         match icmp_packet.get_icmp_type() {
             IcmpTypes::TimeExceeded => {
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
                 let hop = hop_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending TimeExceed for hop {}", hop);
+                debug!("sending TimeExceeded for hop {hop}");
                 if tx1
                     .send(Message::TimeExceeded(Payload {
                         id,
@@ -104,7 +111,16 @@ pub async fn receive(
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
                 let hop = hop_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending EchoReply for hop {}", hop);
+                if final_hop == 0 {
+                    final_hop = hop;
+                }
+
+                if hop > final_hop {
+                    warn!(hop, final_hop, "received hop > final_hop");
+                    continue;
+                }
+
+                debug!("sending EchoReply for hop {hop}");
                 if tx1
                     .send(Message::EchoReply(Payload {
                         id,
@@ -123,7 +139,16 @@ pub async fn receive(
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
                 let hop = hop_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending DestinationUnreachable for hop {}", hop);
+                if final_hop == 0 {
+                    final_hop = hop;
+                }
+
+                if hop > final_hop {
+                    warn!(hop, final_hop, "received hop > final_hop");
+                    continue;
+                }
+
+                debug!("sending DestinationUnreachable for hop {hop}");
                 if tx1
                     .send(Message::DestinationUnreachable(Payload {
                         id,
@@ -141,7 +166,8 @@ pub async fn receive(
             _ => {}
         }
     }
-    info!("receiver: exiting");
+
+    info!("exiting");
 
     Ok(())
 }

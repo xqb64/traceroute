@@ -9,7 +9,7 @@ use tokio::sync::{
     mpsc::{Receiver, Sender},
     Semaphore,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info, instrument};
 
 macro_rules! add_msg {
     ($id_table:expr, $hop:expr, $rguard:expr, $msg:expr) => {{
@@ -18,6 +18,7 @@ macro_rules! add_msg {
     }};
 }
 
+#[instrument(skip_all, name = "printer")]
 pub async fn print_results(
     responses: Arc<Mutex<[Vec<Message>; u8::MAX as usize]>>,
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
@@ -40,13 +41,13 @@ pub async fn print_results(
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg);
 
-                info!(r#"printer: got "TimeExceeded" for hop {}"#, hop);
+                debug!(r#"printer: got "TimeExceeded" for hop {}"#, hop);
             }
             Message::DestinationUnreachable(payload) | Message::EchoReply(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg.clone());
 
-                info!(
+                debug!(
                     "printer: got {:?} for hop {}",
                     if let Message::DestinationUnreachable(_) = msg {
                         "DestinationUnreachable"
@@ -65,7 +66,7 @@ pub async fn print_results(
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg);
 
-                info!(
+                debug!(
                     r#"printer: got "Timeout" for hop {} numprobe {}"#,
                     hop, payload.numprobe
                 );
