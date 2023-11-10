@@ -1,4 +1,4 @@
-use crate::internal::{numprobe_from_id, time_from_id, Message, Payload};
+use crate::internal::{hop_from_id, numprobe_from_id, time_from_id, Message, Payload};
 use crate::net::{create_sock, id_from_payload, reverse_dns_lookup, ICMP_HDR_LEN, IP_HDR_LEN};
 use anyhow::{bail, Result};
 use pnet::packet::{
@@ -11,16 +11,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::{
-    sync::{
-        mpsc::{Receiver, Sender},
-        Semaphore,
-    },
+    sync::mpsc::{Receiver, Sender},
     time::Instant,
 };
 use tracing::{error, info};
 
 pub async fn receive(
-    semaphore: Arc<Semaphore>,
     timetable: Arc<Mutex<HashMap<u16, Instant>>>,
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
     tx1: Sender<Message>,
@@ -60,14 +56,14 @@ pub async fn receive(
             original_ipv4_packet.get_identification()
         };
 
-        let rtt = time_from_id(&timetable, id).await?;
-
         if !recvd.contains(&id) {
             recvd.insert(id);
         } else {
-            println!("receiving duplicates");
+            info!("receiver: receiving duplicates for {}", id);
             continue;
         }
+
+        let rtt = time_from_id(&timetable, id).await?;
 
         let hostname = dns_cache
             .entry(ip_addr)
@@ -75,7 +71,7 @@ pub async fn receive(
                 Ok(host) => host,
                 Err(e) => {
                     error!(
-                        "receiver: error looking up ip addr: {} -- breaking printer and exiting",
+                        "receiver: error looking up {} -- breaking printer and exiting",
                         e
                     );
                     tx1.send(Message::BreakPrinter).await?;
@@ -87,7 +83,9 @@ pub async fn receive(
         match icmp_packet.get_icmp_type() {
             IcmpTypes::TimeExceeded => {
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
+                let hop = hop_from_id(id_table.clone(), id)?;
 
+                info!("receiver: sending TimeExceed for hop {}", hop);
                 if tx1
                     .send(Message::TimeExceeded(Payload {
                         id,
@@ -101,14 +99,12 @@ pub async fn receive(
                 {
                     break;
                 }
-
-                semaphore.add_permits(1);
-                info!("receiver: added one more permit");
             }
             IcmpTypes::EchoReply => {
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
+                let hop = hop_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending EchoReply for hop {}", id);
+                info!("receiver: sending EchoReply for hop {}", hop);
                 if tx1
                     .send(Message::EchoReply(Payload {
                         id,
@@ -125,8 +121,9 @@ pub async fn receive(
             }
             IcmpTypes::DestinationUnreachable => {
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
+                let hop = hop_from_id(id_table.clone(), id)?;
 
-                info!("receiver: sending DestinationUnreachable for hop {}", id);
+                info!("receiver: sending DestinationUnreachable for hop {}", hop);
                 if tx1
                     .send(Message::DestinationUnreachable(Payload {
                         id,

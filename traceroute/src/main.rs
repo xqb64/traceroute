@@ -61,11 +61,16 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
 
     let responses = Arc::new(Mutex::new(responses));
 
-    let printer = tokio::spawn(print_results(responses.clone(), id_table.clone(), rx1, tx2));
+    let printer = tokio::spawn(print_results(
+        responses.clone(),
+        id_table.clone(),
+        rx1,
+        tx2,
+        semaphore.clone(),
+    ));
     info!("printer: spawned");
 
     let receiver = tokio::spawn(receive(
-        semaphore.clone(),
         timetable.clone(),
         id_table.clone(),
         tx1.clone(),
