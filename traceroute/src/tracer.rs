@@ -15,7 +15,7 @@ use tokio::{
     sync::{mpsc::Sender, Semaphore},
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(
@@ -67,7 +67,7 @@ pub async fn trace(
             .await?;
 
             /* Marking the response as not received. */
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs_f32(0.5)).await;
 
             {
                 debug!("thinking ttl {ttl} numprobe {numprobe} timed out");
@@ -90,14 +90,13 @@ pub async fn trace(
                         .await
                         .is_err()
                     {
-                        error!("sending Timeout to printer failed");
-                        return Ok(());
+                        warn!("sending Timeout to printer failed");
                     }
                 }
             }
         }
 
-        debug!("forgetting the permit");
+        debug!("dropping the permit");
         drop(permit);
     }
 
