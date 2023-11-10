@@ -1,5 +1,8 @@
 use anyhow::{bail, Result};
-use libc::{c_char, getnameinfo, in_addr, sockaddr, sockaddr_in, socklen_t, AF_INET, NI_MAXHOST};
+use libc::{
+    addrinfo, c_char, freeaddrinfo, gai_strerror, getaddrinfo, getnameinfo, in_addr, sockaddr,
+    sockaddr_in, socklen_t, AF_INET, NI_MAXHOST, NI_NUMERICHOST,
+};
 use pnet::packet::{
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
     ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
@@ -14,6 +17,7 @@ use raw_socket::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    ffi::{CStr, CString},
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
@@ -54,7 +58,7 @@ async fn main() {
 }
 
 async fn run(target: &str, protocol: &str) -> Result<()> {
-    let target_ip = to_ipaddr(target)?;
+    let target_ip = to_ipaddr(target).await?;
     let protocol = protocol.parse::<TracerouteProtocol>()?;
 
     info!("traceroute for {} using {:?}", target_ip, protocol);
@@ -158,7 +162,7 @@ async fn trace(
                 numprobe + 1
             );
             // println!("send_probe: ttl {} numprobe {}", ttl, numprobe + 1);
-            send_probe(
+            let id = send_probe(
                 target,
                 protocol,
                 ttl,
@@ -188,7 +192,7 @@ async fn trace(
                     info!("tracer {}: ttl {} definitely timed out", n, ttl);
                     if tx1
                         .send(Message::Timeout(Payload {
-                            id: ttl as u16,
+                            id,
                             numprobe: numprobe + 1,
                             hostname: None,
                             ip_addr: None,
@@ -219,7 +223,7 @@ async fn send_probe(
     numprobe: usize,
     timetable: Arc<Mutex<HashMap<u16, Instant>>>,
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
-) -> Result<()> {
+) -> Result<u16> {
     let sock = RawSocket::new(
         Domain::ipv4(),
         Type::raw(),
@@ -255,7 +259,7 @@ async fn send_probe(
 
     timetable.lock().unwrap().insert(id as u16, Instant::now());
 
-    Ok(())
+    Ok(id)
 }
 
 async fn receive(
@@ -384,6 +388,67 @@ async fn receive(
     Ok(())
 }
 
+async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
+    /* prepare the hints for the getaddrinfo call */
+    let hints = addrinfo {
+        ai_family: AF_INET,
+        ai_socktype: 0,
+        ai_protocol: 0,
+        ai_flags: 0,
+        ai_addrlen: 0,
+        ai_canonname: std::ptr::null_mut(),
+        ai_addr: std::ptr::null_mut(),
+        ai_next: std::ptr::null_mut(),
+    };
+    let mut res: *mut addrinfo = std::ptr::null_mut();
+    let c_hostname = CString::new(hostname)?;
+
+    /* perform the DNS lookup */
+    let err = unsafe { getaddrinfo(c_hostname.as_ptr(), std::ptr::null(), &hints, &mut res) };
+    if err != 0 {
+        /* if the lookup failed, return the error */
+        let err_str = unsafe { CStr::from_ptr(gai_strerror(err)).to_str()? };
+        bail!("DNS lookup for host {} failed: {}", hostname, err_str);
+    }
+
+    /* res now points to a linked list of addrinfo structures */
+    /* convert the IP address from the first addrinfo structure to a string */
+    let addr = unsafe { (*res).ai_addr as *const sockaddr };
+    let mut host: [libc::c_char; NI_MAXHOST as usize] = [0; NI_MAXHOST as usize];
+
+    /* use getnameinfo to convert the address into a string */
+    let s = unsafe {
+        getnameinfo(
+            addr,
+            (*res).ai_addrlen,
+            host.as_mut_ptr(),
+            host.len() as socklen_t,
+            /* not interested in service info */
+            std::ptr::null_mut(),
+            0,
+            /* return the numeric form of the hostname */
+            NI_NUMERICHOST,
+        )
+    };
+
+    /* free the mem allocated by getaddrinfo */
+    unsafe { freeaddrinfo(res) };
+
+    if s != 0 {
+        /* if the conversion failed, bail */
+        let err_str = unsafe { CStr::from_ptr(gai_strerror(s)).to_str()? };
+        bail!(
+            "address conversion for host {} failed: {}",
+            hostname,
+            err_str
+        );
+    }
+
+    /* convert the C string to a Rust IpAddr and return it */
+    let c_str = unsafe { CStr::from_ptr(host.as_ptr()) };
+    Ok(c_str.to_str()?.to_string().parse::<IpAddr>()?)
+}
+
 async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
     let ip = match ip_addr {
         SocketAddr::V4(ipv4_addr) => *ipv4_addr.ip(),
@@ -510,6 +575,13 @@ macro_rules! print_probe {
     }};
 }
 
+macro_rules! add_msg {
+    ($id_table:expr, $hop:expr, $rguard:expr, $msg:expr) => {{
+        $rguard[$hop as usize - 1].push($msg);
+        sort(&mut $rguard[$hop as usize - 1]);
+    }};
+}
+
 async fn print_results(
     responses: Arc<Mutex<[Vec<Message>; u8::MAX as usize]>>,
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
@@ -528,29 +600,24 @@ async fn print_results(
         let mut rguard = { responses.lock().unwrap() };
         match msg.clone() {
             Message::TimeExceeded(payload) => {
-                let hop = hop_from_id(id_table.clone(), payload.id)?;
-                rguard[hop as usize - 1].push(msg);
-                sort(&mut rguard[hop as usize - 1]);
-                info!("printer: got TimeExceeded for hop {}", hop);
-            }
-            Message::DestinationUnreachable(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
-                rguard[hop as usize - 1].push(msg);
-                sort(&mut rguard[hop as usize - 1]);
+                add_msg!(id_table, hop, rguard, msg);
 
-                info!("printer: got DestinationUnreachable for hop {}", hop);
-
-                if final_hop == 0 {
-                    final_hop = hop;
-                    info!("printer: set final_hop to {}", final_hop);
-                }
+                info!(r#"printer: got "TimeExceeded" for hop {}"#, hop);
             }
-            Message::EchoReply(payload) => {
+            Message::DestinationUnreachable(payload) | Message::EchoReply(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
+                add_msg!(id_table, hop, rguard, msg.clone());
 
-                rguard[hop as usize - 1].push(msg);
-                sort(&mut rguard[hop as usize - 1]);
-                info!("printer: got EchoReply for hop {}", hop);
+                info!(
+                    "printer: got {:?} for hop {}",
+                    if let Message::DestinationUnreachable(_) = msg {
+                        "DestinationUnreachable"
+                    } else {
+                        "EchoReply"
+                    },
+                    hop
+                );
 
                 if final_hop == 0 {
                     final_hop = hop;
@@ -558,12 +625,13 @@ async fn print_results(
                 }
             }
             Message::Timeout(payload) => {
+                let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
+                add_msg!(id_table, hop, rguard, msg);
+
                 info!(
-                    "printer: got Timeout for hop {} numprobe {}",
-                    payload.id, payload.numprobe
+                    r#"printer: got "Timeout" for hop {} numprobe {}"#,
+                    hop, payload.numprobe
                 );
-                rguard[payload.id as usize - 1].push(msg);
-                sort(&mut rguard[payload.id as usize - 1]);
             }
             _ => {}
         }
@@ -571,29 +639,14 @@ async fn print_results(
         while last_printed < u8::MAX && !rguard[last_printed as usize].is_empty() {
             if let Some(response) = rguard[last_printed as usize].pop() {
                 match response.clone() {
-                    Message::TimeExceeded(payload) => {
+                    Message::TimeExceeded(payload)
+                    | Message::DestinationUnreachable(payload)
+                    | Message::EchoReply(payload)
+                    | Message::Timeout(payload) => {
                         let hop = hop_from_id(id_table.clone(), payload.id)?;
                         let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
 
                         print_probe!(payload, hop, expected_numprobe, last_printed, 'mainloop);
-                    }
-                    Message::DestinationUnreachable(payload) => {
-                        let hop = hop_from_id(id_table.clone(), payload.id)?;
-                        let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
-
-                        print_probe!(payload, hop, expected_numprobe, last_printed, 'mainloop);
-                    }
-                    Message::EchoReply(payload) => {
-                        let hop = hop_from_id(id_table.clone(), payload.id)?;
-                        let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
-
-                        print_probe!(payload, hop, expected_numprobe, last_printed, 'mainloop);
-                    }
-                    Message::Timeout(payload) => {
-                        let expected_numprobe =
-                            expected_numprobes.get_mut(&(payload.id as u8)).unwrap();
-
-                        print_probe!(payload, payload.id as u8, expected_numprobe, last_printed, 'mainloop);
                     }
                     _ => {}
                 }
@@ -606,11 +659,13 @@ async fn print_results(
             }
         }
     }
+
     if tx2.send(Message::BreakReceiver).await.is_ok() {
         info!("printer: sent BreakReceiver");
     }
 
     info!("printer: exiting");
+
     Ok(())
 }
 
@@ -668,11 +723,11 @@ fn build_udp_packet(buf: &mut [u8]) -> NextPacket {
     NextPacket::Udp(packet)
 }
 
-fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
+async fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
     match target.parse::<Ipv4Addr>() {
         Ok(addr) => Ok(addr),
-        Err(_) => match dns_lookup::lookup_host(target) {
-            Ok(ip_addrs) => match ip_addrs[0] {
+        Err(_) => match dns_lookup(target).await {
+            Ok(ip_addr) => match ip_addr {
                 IpAddr::V4(addr) => Ok(addr),
                 IpAddr::V6(_) => bail!("not implemented for ipv6."),
             },
