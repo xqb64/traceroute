@@ -19,8 +19,9 @@ use tracing::{debug, error, info, instrument, warn};
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(
-    skip(tx1, responses, id_table, target, protocol, semaphore, ttl, timetable),
+    skip_all,
     name = "tracer"
+    fields(n = n)
 )]
 pub async fn trace(
     n: u8,
@@ -104,7 +105,7 @@ pub async fn trace(
     Ok(())
 }
 
-#[instrument(skip(target, protocol, timetable, id_table), name = "prober")]
+#[instrument(skip_all, name = "prober", fields(n = ttl))]
 async fn send_probe(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
