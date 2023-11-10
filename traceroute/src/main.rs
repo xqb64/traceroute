@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use libc::{getnameinfo, sockaddr, sockaddr_in, socklen_t, NI_MAXHOST};
+use libc::{c_char, getnameinfo, in_addr, sockaddr, sockaddr_in, socklen_t, AF_INET, NI_MAXHOST};
 use pnet::packet::{
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
     ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
@@ -389,27 +389,36 @@ async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
         SocketAddr::V4(ipv4_addr) => *ipv4_addr.ip(),
         SocketAddr::V6(_) => bail!("not implemented for ipv6"),
     };
-    let sockaddr = SocketAddrV4::new(ip, 0);
+
+    let sockaddr = SocketAddrV4::new(ip, 0); /* port is irrelevant for DNS */
     let sockaddr_in = sockaddr_in {
-        sin_family: libc::AF_INET as u16,
+        sin_family: AF_INET as u16,
         sin_port: 0,
-        sin_addr: libc::in_addr {
+        sin_addr: in_addr {
+            /* native endianness */
             s_addr: u32::from_ne_bytes(sockaddr.ip().octets()),
         },
+        /* padding to make the structure the same size as sock_addr */
         sin_zero: [0; 8],
     };
 
     tokio::task::spawn_blocking(move || {
-        let mut host = [0 as libc::c_char; NI_MAXHOST as usize];
+        /* NI_MAXHOST is the maximum size of the buffer (in bytes)
+         * that can hold a fully-qualified domain name */
+        let mut host = [0 as c_char; NI_MAXHOST as usize];
 
         let ret = unsafe {
             getnameinfo(
+                /* cast the reference to a pointer, and then cast that pointer to *sock_addr */
                 &sockaddr_in as *const _ as *const sockaddr,
                 std::mem::size_of::<sockaddr_in>() as socklen_t,
                 host.as_mut_ptr(),
                 host.len() as socklen_t,
+                /* not interested in retreiving the service name */
                 std::ptr::null_mut(),
                 0,
+                /* Internationalized Domain Name
+                 * (see https://en.wikipedia.org/wiki/Internationalized_domain_name) */
                 NI_IDN,
             )
         };
@@ -425,6 +434,7 @@ async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
     .await
     .unwrap()
 }
+
 fn hop_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16) -> Result<u8> {
     if let Some(&entry) = id_table.lock().unwrap().get(&id) {
         Ok(entry.0)
