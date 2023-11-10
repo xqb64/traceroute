@@ -18,21 +18,21 @@ authors = ["Will <will@glozer.net>"]
 description = "Blocking and async raw sockets"
 license = "MIT"
 [dependencies.libc]
-version = "0.2.81"
+version = "0.2.150"
 
 [dependencies.socket2]
 version = "0.3.19"
 
 [dependencies.tokio]
-version = "1.0.1"
+version = "1.34.0"
 features = ["net"]
 optional = true
 default-features = false
 [dev-dependencies.anyhow]
-version = "1.0.37"
+version = "1.0.75"
 
 [dev-dependencies.tokio]
-version = "1.0.1"
+version = "1.34.0"
 features = ["macros", "rt-multi-thread"]
 
 [features]
