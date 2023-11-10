@@ -7,7 +7,7 @@ use raw_socket::{
     Domain, Protocol, Type,
 };
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry::Vacant, HashMap},
     net::Ipv4Addr,
     sync::{Arc, Mutex},
 };
@@ -123,11 +123,17 @@ async fn send_probe(
     let ip_next_hdr_len = protocol.get_next_header_length();
     let mut ip_next_hdr_buf = protocol.get_ipv4_next_header_buffer();
     let ip_next_hdr_protocol = protocol.get_next_header_protocol();
-    let id = rand::random::<u16>();
+    let mut id;
 
     {
         let mut guard = id_table.lock().unwrap();
-        guard.insert(id, (ttl, numprobe));
+        loop {
+            id = rand::random::<u16>();
+            if let Vacant(e) = guard.entry(id) {
+                e.insert((ttl, numprobe));
+                break;
+            }
+        }
     }
 
     let mut ipv4_packet = build_ipv4_packet(
@@ -146,7 +152,7 @@ async fn send_probe(
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
     sock.send_to(ipv4_packet.packet(), (target, 33434)).await?;
 
-    timetable.lock().unwrap().insert(id as u16, Instant::now());
+    timetable.lock().unwrap().insert(id, Instant::now());
 
     Ok(id)
 }
