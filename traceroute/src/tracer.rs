@@ -15,9 +15,13 @@ use tokio::{
     sync::{mpsc::Sender, Semaphore},
     time::{Duration, Instant},
 };
-use tracing::info;
+use tracing::{debug, error, info, instrument, warn};
 
 #[allow(clippy::too_many_arguments)]
+#[instrument(
+    skip(tx1, responses, id_table, target, protocol, semaphore, ttl, timetable),
+    name = "tracer"
+)]
 pub async fn trace(
     n: u8,
     tx1: Sender<Message>,
@@ -32,10 +36,10 @@ pub async fn trace(
     /* Allow no more than MAX_TASKS_IN_FLIGHT tasks to run concurrently.
      * We are limiting the number of tasks in flight so we don't end up
      * sending more packets than needed by spawning too many tasks. */
-    info!("tracer {} wants to acquire the semaphore", n);
+    debug!("trying to acquire the semaphore");
     if let Ok(permit) = semaphore.acquire().await {
         /* Each task increments the TTL and sends a probe. */
-        info!("tracer {} successfully acquired the semaphore", n);
+        debug!("successfully acquired the semaphore");
 
         let ttl = {
             let mut counter = ttl.lock().unwrap();
@@ -43,24 +47,19 @@ pub async fn trace(
             *counter
         };
 
-        for numprobe in 0..3 {
+        for numprobe in 1..=3 {
             if semaphore.is_closed() {
-                info!("tracer {}: break because of closed semaphore", n);
+                warn!("break because of the closed semaphore");
                 break;
             }
 
-            info!(
-                "tracer {} probing ttl {} for the {}. time",
-                n,
-                ttl,
-                numprobe + 1
-            );
+            info!("probing ttl {ttl} for the {numprobe}. time",);
             // println!("send_probe: ttl {} numprobe {}", ttl, numprobe + 1);
             let id = send_probe(
                 target,
                 protocol,
                 ttl,
-                numprobe + 1,
+                numprobe,
                 timetable.clone(),
                 id_table.clone(),
             )
@@ -70,24 +69,19 @@ pub async fn trace(
             tokio::time::sleep(Duration::from_secs(1)).await;
 
             {
-                info!(
-                    "tracer {} thinks ttl {} numprobe {} timed out",
-                    n,
-                    ttl,
-                    numprobe + 1
-                );
+                debug!("thinking ttl {ttl} numprobe {numprobe} timed out");
 
                 let response = {
                     let guard = { responses.lock().unwrap() };
-                    guard[ttl as usize - 1].get(numprobe).cloned()
+                    guard[ttl as usize - 1].get(numprobe - 1).cloned()
                 };
 
                 if response.is_none() {
-                    info!("tracer {}: ttl {} definitely timed out", n, ttl);
+                    debug!("ttl {ttl} definitely timed out");
                     if tx1
                         .send(Message::Timeout(Payload {
                             id,
-                            numprobe: numprobe + 1,
+                            numprobe,
                             hostname: None,
                             ip_addr: None,
                             rtt: None,
@@ -95,20 +89,22 @@ pub async fn trace(
                         .await
                         .is_err()
                     {
+                        error!("sending Timeout to printer failed");
                         return Ok(());
                     }
                 }
             }
         }
 
-        info!("tracer {}: forgetting the permit", n);
+        debug!("forgetting the permit");
         drop(permit);
     }
 
-    info!("tracer {}: exiting", n);
+    info!("exiting");
     Ok(())
 }
 
+#[instrument(skip(target, protocol, timetable, id_table), name = "prober")]
 async fn send_probe(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
@@ -136,6 +132,8 @@ async fn send_probe(
             if let Vacant(e) = guard.entry(id) {
                 e.insert((ttl, numprobe));
                 break;
+            } else {
+                warn!("generated random id {id}, trying again");
             }
         }
     }
