@@ -44,6 +44,11 @@ pub async fn trace(
         };
 
         for numprobe in 0..3 {
+            if semaphore.is_closed() {
+                info!("tracer {}: break because of closed semaphore", n);
+                break;
+            }
+
             info!(
                 "tracer {} probing ttl {} for the {}. time",
                 n,
@@ -90,7 +95,6 @@ pub async fn trace(
                         .await
                         .is_err()
                     {
-                        semaphore.close();
                         return Ok(());
                     }
                 }

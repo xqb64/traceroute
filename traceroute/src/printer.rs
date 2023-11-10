@@ -113,6 +113,9 @@ pub async fn print_results(
 
     if tx2.send(Message::BreakReceiver).await.is_ok() {
         info!("printer: sent BreakReceiver");
+
+        semaphore.close();
+        info!("printer: closed the semaphore");
     }
 
     info!("printer: exiting");
