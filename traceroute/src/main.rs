@@ -1,23 +1,17 @@
 use anyhow::Result;
 
-use crate::internal::Message;
-use crate::net::{to_ipaddr, TracerouteProtocol};
-use crate::printer::print_results;
-use crate::receiver::receive;
-use crate::tracer::trace;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 use structopt::StructOpt;
 use tokio::sync::{mpsc::channel, Semaphore};
+use traceroute::internal::Message;
+use traceroute::net::{to_ipaddr, TracerouteProtocol};
+use traceroute::printer::print_results;
+use traceroute::receiver::receive;
+use traceroute::tracer::trace;
 use tracing::info;
-
-mod internal;
-mod net;
-mod printer;
-mod receiver;
-mod tracer;
 
 const START_TTL: u8 = 0;
 const MAX_TASKS_IN_FLIGHT: usize = 4;

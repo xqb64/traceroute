@@ -1,3 +1,4 @@
+use crate::error_and_bail;
 use anyhow::{bail, Result};
 use libc::{
     addrinfo, c_char, freeaddrinfo, gai_strerror, getaddrinfo, getnameinfo, in_addr, sockaddr,
@@ -51,7 +52,7 @@ pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
     if err != 0 {
         /* if the lookup failed, return the error */
         let err_str = unsafe { CStr::from_ptr(gai_strerror(err)).to_str()? };
-        bail!("DNS lookup for host {hostname} failed: {err_str}");
+        error_and_bail!("DNS lookup for host {hostname} failed: {err_str}");
     }
 
     /* res now points to a linked list of addrinfo structures */
@@ -78,9 +79,9 @@ pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
     unsafe { freeaddrinfo(res) };
 
     if s != 0 {
-        /* if the conversion failed, bail */
+        /* if the conversion failed,error_and_bail */
         let err_str = unsafe { CStr::from_ptr(gai_strerror(s)).to_str()? };
-        bail!("address conversion for host {hostname} failed: {err_str}");
+        error_and_bail!("address conversion for host {hostname} failed: {err_str}");
     }
 
     /* convert the C string to a Rust IpAddr and return it */
@@ -91,7 +92,7 @@ pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
 pub async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
     let ip = match ip_addr {
         SocketAddr::V4(ipv4_addr) => *ipv4_addr.ip(),
-        SocketAddr::V6(_) => bail!("not implemented for ipv6"),
+        SocketAddr::V6(_) => error_and_bail!("not implemented for ipv6"),
     };
 
     let sockaddr = SocketAddrV4::new(ip, 0); /* port is irrelevant for DNS */
@@ -128,8 +129,7 @@ pub async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
         };
 
         if ret != 0 {
-            error!("getnameinfo for {ip} failed: {ret}");
-            bail!("getnameinfo for {ip} failed: {ret}");
+            error_and_bail!("getnameinfo for {ip} failed: {ret}");
         }
 
         let c_str = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
@@ -199,9 +199,9 @@ pub async fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
         Err(_) => match dns_lookup(target).await {
             Ok(ip_addr) => match ip_addr {
                 IpAddr::V4(addr) => Ok(addr),
-                IpAddr::V6(_) => bail!("not implemented for ipv6."),
+                IpAddr::V6(_) => error_and_bail!("not implemented for ipv6."),
             },
-            Err(_) => bail!("couldn't resolve the hostname {target}"),
+            Err(_) => error_and_bail!("couldn't resolve the hostname {target}"),
         },
     }
 }
@@ -217,7 +217,7 @@ pub fn id_from_payload(payload: &[u8]) -> u16 {
 pub fn create_sock() -> Result<Arc<RawSocket>> {
     match RawSocket::new(Domain::ipv4(), Type::raw(), Protocol::icmpv4().into()) {
         Ok(sock) => Ok(Arc::new(sock)),
-        Err(_) => bail!("couldn't create the socket"),
+        Err(_) => error_and_bail!("couldn't create the socket"),
     }
 }
 
@@ -271,7 +271,7 @@ impl FromStr for TracerouteProtocol {
         match s {
             "icmp" => Ok(TracerouteProtocol::Icmp),
             "udp" => Ok(TracerouteProtocol::Udp),
-            _ => bail!("unsupported protocol: {s}"),
+            _ => error_and_bail!("unsupported protocol: {s}"),
         }
     }
 }

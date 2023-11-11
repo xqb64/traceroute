@@ -1,3 +1,4 @@
+use crate::error_and_bail;
 use anyhow::{bail, Result};
 use std::{
     collections::HashMap,
@@ -5,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::time::{Duration, Instant};
+use tracing::error;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -29,7 +31,7 @@ pub fn hop_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16) -> 
     if let Some(&entry) = id_table.lock().unwrap().get(&id) {
         Ok(entry.0)
     } else {
-        bail!("id {id} not found in id_table");
+        error_and_bail!("id {id} not found in id_table");
     }
 }
 
@@ -37,7 +39,7 @@ pub fn numprobe_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16
     if let Some(&entry) = id_table.lock().unwrap().get(&id) {
         Ok(entry.1)
     } else {
-        bail!("id {id} not found in id_table");
+        error_and_bail!("id {id} not found in id_table");
     }
 }
 
@@ -48,6 +50,6 @@ pub async fn time_from_id(
 ) -> Result<Duration> {
     match timetable.lock().unwrap().get(&id) {
         Some(time) => Ok(instant.duration_since(*time)),
-        None => bail!("id {id} not found in timetable"),
+        None => error_and_bail!("id {id} not found in timetable"),
     }
 }

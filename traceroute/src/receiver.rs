@@ -1,3 +1,4 @@
+use crate::error_and_bail;
 use crate::internal::{hop_from_id, numprobe_from_id, time_from_id, Message, Payload};
 use crate::net::{create_sock, id_from_payload, reverse_dns_lookup, ICMP_HDR_LEN, IP_HDR_LEN};
 use anyhow::{bail, Result};
@@ -43,7 +44,7 @@ pub async fn receive(
 
         let icmp_packet = match IcmpPacket::new(&recv_buf[IP_HDR_LEN..]) {
             Some(packet) => packet,
-            None => bail!("couldn't make icmp packet"),
+            None => error_and_bail!("couldn't make icmp packet"),
         };
 
         let id = if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
@@ -55,7 +56,7 @@ pub async fn receive(
             let original_ipv4_packet = match Ipv4Packet::new(&recv_buf[IP_HDR_LEN + ICMP_HDR_LEN..])
             {
                 Some(packet) => packet,
-                None => bail!("couldn't make ivp4 packet"),
+                None => error_and_bail!("couldn't make ivp4 packet"),
             };
 
             original_ipv4_packet.get_identification()
