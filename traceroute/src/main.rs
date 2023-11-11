@@ -38,7 +38,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     let target_ip = to_ipaddr(target).await?;
     let protocol = protocol.parse::<TracerouteProtocol>()?;
 
-    info!("traceroute for {} using {:?}", target_ip, protocol);
+    info!("traceroute for {target_ip} using {protocol:?}");
 
     let semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_FLIGHT));
 
@@ -92,11 +92,11 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
             ttl.clone(),
             timetable.clone(),
         )));
-        info!("tracer {}: spawned", n);
+        info!("tracer {n}: spawned");
     }
 
     for (n, task) in tasks.into_iter().enumerate() {
-        info!("awaiting task {}", n);
+        info!("awaiting task {n}");
         task.await??;
     }
     info!("awaited all tasks");

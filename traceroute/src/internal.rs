@@ -29,7 +29,7 @@ pub fn hop_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16) -> 
     if let Some(&entry) = id_table.lock().unwrap().get(&id) {
         Ok(entry.0)
     } else {
-        bail!("id {} not found", id);
+        bail!("id {id} not found in id_table");
     }
 }
 
@@ -37,7 +37,7 @@ pub fn numprobe_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16
     if let Some(&entry) = id_table.lock().unwrap().get(&id) {
         Ok(entry.1)
     } else {
-        bail!("id {} not found", id);
+        bail!("id {id} not found in id_table");
     }
 }
 
@@ -48,6 +48,6 @@ pub async fn time_from_id(
 ) -> Result<Duration> {
     match timetable.lock().unwrap().get(&id) {
         Some(time) => Ok(instant.duration_since(*time)),
-        None => bail!("did not find time {} in the timetable", id),
+        None => bail!("id {id} not found in timetable"),
     }
 }

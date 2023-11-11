@@ -51,7 +51,7 @@ pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
     if err != 0 {
         /* if the lookup failed, return the error */
         let err_str = unsafe { CStr::from_ptr(gai_strerror(err)).to_str()? };
-        bail!("DNS lookup for host {} failed: {}", hostname, err_str);
+        bail!("DNS lookup for host {hostname} failed: {err_str}");
     }
 
     /* res now points to a linked list of addrinfo structures */
@@ -80,11 +80,7 @@ pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
     if s != 0 {
         /* if the conversion failed, bail */
         let err_str = unsafe { CStr::from_ptr(gai_strerror(s)).to_str()? };
-        bail!(
-            "address conversion for host {} failed: {}",
-            hostname,
-            err_str
-        );
+        bail!("address conversion for host {hostname} failed: {err_str}");
     }
 
     /* convert the C string to a Rust IpAddr and return it */
@@ -132,8 +128,8 @@ pub async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
         };
 
         if ret != 0 {
-            error!("getnameinfo for {} failed: {}", ip, ret);
-            bail!("getnameinfo for {} failed: {}", ip, ret);
+            error!("getnameinfo for {ip} failed: {ret}");
+            bail!("getnameinfo for {ip} failed: {ret}");
         }
 
         let c_str = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
@@ -205,7 +201,7 @@ pub async fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
                 IpAddr::V4(addr) => Ok(addr),
                 IpAddr::V6(_) => bail!("not implemented for ipv6."),
             },
-            Err(_) => bail!("couldn't resolve the hostname"),
+            Err(_) => bail!("couldn't resolve the hostname {target}"),
         },
     }
 }
@@ -275,7 +271,7 @@ impl FromStr for TracerouteProtocol {
         match s {
             "icmp" => Ok(TracerouteProtocol::Icmp),
             "udp" => Ok(TracerouteProtocol::Udp),
-            _ => bail!("unsupported protocol: {}", s),
+            _ => bail!("unsupported protocol: {s}"),
         }
     }
 }

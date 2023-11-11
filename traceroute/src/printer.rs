@@ -41,38 +41,34 @@ pub async fn print_results(
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg);
 
-                debug!(r#"printer: got "TimeExceeded" for hop {}"#, hop);
+                debug!("got TimeExceeded for hop {hop}");
             }
             Message::DestinationUnreachable(payload) | Message::EchoReply(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg.clone());
 
-                debug!(
-                    "printer: got {:?} for hop {}",
-                    if let Message::DestinationUnreachable(_) = msg {
-                        "DestinationUnreachable"
-                    } else {
-                        "EchoReply"
-                    },
-                    hop
-                );
+                let icmp_type = if let Message::DestinationUnreachable(_) = msg {
+                    "DestinationUnreachable"
+                } else {
+                    "EchoReply"
+                };
+
+                debug!("got {icmp_type} for hop {hop}");
 
                 if final_hop == 0 {
                     final_hop = hop;
-                    info!("printer: set final_hop to {}", final_hop);
+                    info!("set final_hop to {final_hop}");
                 }
             }
             Message::Timeout(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg);
 
-                debug!(
-                    r#"printer: got "Timeout" for hop {} numprobe {}"#,
-                    hop, payload.numprobe
-                );
+                let numprobe = payload.numprobe;
+                debug!("got Timeout for hop {hop} (numprobe {numprobe})");
             }
             Message::BreakPrinter => {
-                error!("printer: received BreakPrinter, breaking");
+                error!("received BreakPrinter, breaking");
                 break 'mainloop;
             }
             _ => {}
@@ -106,20 +102,20 @@ pub async fn print_results(
 
             let expected_numprobe = expected_numprobes.get(&final_hop).unwrap();
             if last_printed != 0 && *expected_numprobe == 3 && last_printed == final_hop {
-                info!("printer: printed final_hop ({})", final_hop);
+                info!("printed final_hop ({final_hop}), breaking");
                 break 'mainloop;
             }
         }
     }
 
     if tx2.send(Message::BreakReceiver).await.is_ok() {
-        info!("printer: sent BreakReceiver");
+        info!("sent BreakReceiver");
 
         semaphore.close();
-        info!("printer: closed the semaphore");
+        info!("closed the semaphore");
     }
 
-    info!("printer: exiting");
+    info!("exiting");
 
     Ok(())
 }
