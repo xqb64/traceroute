@@ -256,7 +256,7 @@ impl TracerouteProtocol {
         }
     }
 
-    pub fn build_next_packet<'a>(&'a self, next_hdr_buf: &'a mut [u8], id: u16) -> NextPacket {
+    pub fn build_next_packet<'a>(&self, next_hdr_buf: &'a mut [u8], id: u16) -> NextPacket<'a> {
         match self {
             TracerouteProtocol::Udp => build_udp_packet(next_hdr_buf),
             TracerouteProtocol::Icmp => build_icmp_packet(next_hdr_buf, id),
