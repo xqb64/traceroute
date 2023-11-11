@@ -29,7 +29,7 @@ const UDP_HDR_LEN: usize = 8;
 
 const TRACEROUTE_PORT: usize = 33434;
 
-pub const NI_IDN: i32 = 0;
+pub const NI_IDN: i32 = 32;
 pub const IPPROTO_RAW: i32 = 255;
 
 pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
