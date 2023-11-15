@@ -1,8 +1,8 @@
 use crate::error_and_bail;
 use anyhow::{bail, Result};
 use libc::{
-    addrinfo, c_char, freeaddrinfo, gai_strerror, getaddrinfo, getnameinfo, in_addr, sockaddr,
-    sockaddr_in, socklen_t, AF_INET, NI_MAXHOST, NI_NUMERICHOST,
+    addrinfo, freeaddrinfo, gai_strerror, getaddrinfo, getnameinfo, in_addr, sockaddr, sockaddr_in,
+    socklen_t, AF_INET, NI_MAXHOST, NI_NUMERICHOST,
 };
 use pnet::packet::{
     icmp::{echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket, IcmpTypes},
@@ -110,7 +110,7 @@ pub async fn reverse_dns_lookup(ip_addr: SocketAddr) -> Result<String> {
     tokio::task::spawn_blocking(move || {
         /* NI_MAXHOST is the maximum size of the buffer (in bytes)
          * that can hold a fully-qualified domain name */
-        let mut host = [0 as c_char; NI_MAXHOST as usize];
+        let mut host = [0; NI_MAXHOST as usize];
 
         let ret = unsafe {
             getnameinfo(
