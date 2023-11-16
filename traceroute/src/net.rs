@@ -79,7 +79,7 @@ pub async fn dns_lookup(hostname: &str) -> Result<IpAddr> {
     unsafe { freeaddrinfo(res) };
 
     if s != 0 {
-        /* if the conversion failed,error_and_bail */
+        /* if the conversion failed, error_and_bail */
         let err_str = unsafe { CStr::from_ptr(gai_strerror(s)).to_str()? };
         error_and_bail!("address conversion for host {hostname} failed: {err_str}");
     }
