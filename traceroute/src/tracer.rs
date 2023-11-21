@@ -48,6 +48,8 @@ pub async fn trace(
             *counter
         };
 
+        let mut ids = HashMap::new();
+
         for numprobe in 1..=3 {
             if semaphore.is_closed() {
                 warn!("break because of the closed semaphore");
@@ -66,23 +68,49 @@ pub async fn trace(
             )
             .await?;
 
+            ids.insert((ttl, numprobe), id);
+
             /* Marking the response as not received. */
-            tokio::time::sleep(Duration::from_secs_f32(0.5)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-            {
-                debug!("thinking ttl {ttl} numprobe {numprobe} timed out");
+        {
+            debug!("checking if ttl {ttl} timed out");
 
-                let response = {
-                    let guard = { responses.lock().unwrap() };
-                    guard[ttl as usize - 1].get(numprobe - 1).cloned()
-                };
+            let mut didnt_arrive = vec![1, 2, 3];
+            let mut arrived = vec![];
 
-                if response.is_none() {
-                    debug!("ttl {ttl} definitely timed out");
+            let check_started = tokio::time::Instant::now();
+
+            loop {
+                if tokio::time::Instant::now().duration_since(check_started)
+                    >= tokio::time::Duration::from_secs(3)
+                {
+                    break;
+                }
+
+                for numprobe in didnt_arrive.iter() {
+                    let response = {
+                        let guard = { responses.lock().unwrap() };
+                        guard[ttl as usize - 1].get(*numprobe - 1).cloned()
+                    };
+
+                    if response.is_some() {
+                        arrived.push(*numprobe);
+                    }
+                }
+
+                didnt_arrive.retain(|x| !arrived.contains(x));
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+
+            for numprobe in didnt_arrive.iter() {
+                if let Some(id) = ids.get(&(ttl, *numprobe)) {
                     if tx1
                         .send(Message::Timeout(Payload {
-                            id,
-                            numprobe,
+                            id: *id,
+                            numprobe: *numprobe,
                             hostname: None,
                             ip_addr: None,
                             rtt: None,
@@ -92,6 +120,8 @@ pub async fn trace(
                     {
                         warn!("sending Timeout to printer failed");
                     }
+                } else {
+                    break;
                 }
             }
         }

@@ -12,6 +12,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
+use tokio::sync::Semaphore;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::Instant,
@@ -20,6 +21,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 #[instrument(skip_all, name = "receiver")]
 pub async fn receive(
+    semaphore: Arc<Semaphore>,
     timetable: Arc<Mutex<HashMap<u16, Instant>>>,
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
     tx1: Sender<Message>,
@@ -107,6 +109,9 @@ pub async fn receive(
                 {
                     break;
                 }
+
+                debug!("adding one more permit");
+                semaphore.add_permits(1);
             }
             IcmpTypes::EchoReply => {
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;

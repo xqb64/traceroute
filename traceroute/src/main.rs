@@ -12,13 +12,17 @@ use traceroute::printer::print_results;
 use traceroute::receiver::receive;
 use traceroute::tracer::trace;
 use tracing::info;
+use tracing_subscriber::{self, prelude::*};
 
 const START_TTL: u8 = 0;
 const MAX_TASKS_IN_FLIGHT: usize = 4;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter("error")
+        .finish()
+        .init();
 
     let opt = Opt::from_args();
     let result = run(&opt.target, &opt.protocol).await;
@@ -65,6 +69,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     info!("printer: spawned");
 
     let receiver = tokio::spawn(receive(
+        semaphore.clone(),
         timetable.clone(),
         id_table.clone(),
         tx1.clone(),

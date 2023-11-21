@@ -84,13 +84,8 @@ pub async fn print_results(
                         let hop = hop_from_id(id_table.clone(), payload.id)?;
                         let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
 
-                        let should_continue = print_probe(
-                            semaphore.clone(),
-                            &payload,
-                            hop,
-                            expected_numprobe,
-                            &mut last_printed,
-                        );
+                        let should_continue =
+                            print_probe(&payload, hop, expected_numprobe, &mut last_printed);
 
                         if should_continue.is_ok_and(|r| r) {
                             continue 'mainloop;
@@ -121,7 +116,6 @@ pub async fn print_results(
 }
 
 fn print_probe(
-    semaphore: Arc<Semaphore>,
     payload: &Payload,
     hop: u8,
     expected_numprobe: &mut usize,
@@ -158,7 +152,6 @@ fn print_probe(
         } else if payload.numprobe == 3 {
             if payload.rtt.is_some() {
                 println!("- {:?}", payload.rtt.unwrap());
-                semaphore.add_permits(1);
                 info!("printer: added one more permit");
             } else {
                 println!("*");
