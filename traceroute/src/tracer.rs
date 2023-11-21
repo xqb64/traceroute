@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::{
     sync::{mpsc::Sender, Semaphore},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tracing::{debug, info, instrument, warn};
 
@@ -38,7 +38,7 @@ pub async fn trace(
      * We are limiting the number of tasks in flight so we don't end up
      * sending more packets than needed by spawning too many tasks. */
     debug!("trying to acquire the semaphore");
-    if let Ok(permit) = semaphore.acquire().await {
+    if let Ok(_permit) = semaphore.acquire().await {
         /* Each task increments the TTL and sends a probe. */
         debug!("successfully acquired the semaphore");
 
@@ -69,15 +69,12 @@ pub async fn trace(
             .await?;
 
             ids.insert((ttl, numprobe), id);
-
-            /* Marking the response as not received. */
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         {
             debug!("checking if ttl {ttl} timed out");
 
-            let mut didnt_arrive = vec![1, 2, 3];
+            let mut didnt_arrive = (1..=3).map(|n| (ttl, n)).collect::<Vec<_>>();
             let mut arrived = vec![];
 
             let check_started = tokio::time::Instant::now();
@@ -85,28 +82,30 @@ pub async fn trace(
             loop {
                 if tokio::time::Instant::now().duration_since(check_started)
                     >= tokio::time::Duration::from_secs(3)
+                    || semaphore.is_closed()
+                    || arrived.len() == 3
                 {
                     break;
                 }
 
-                for numprobe in didnt_arrive.iter() {
+                for (ttl, numprobe) in didnt_arrive.iter() {
                     let response = {
                         let guard = { responses.lock().unwrap() };
-                        guard[ttl as usize - 1].get(*numprobe - 1).cloned()
+                        guard[*ttl as usize - 1].get(*numprobe - 1).cloned()
                     };
 
                     if response.is_some() {
-                        arrived.push(*numprobe);
+                        arrived.push((*ttl, *numprobe));
                     }
                 }
 
-                didnt_arrive.retain(|x| !arrived.contains(x));
+                didnt_arrive.retain(|(ttl, np)| !arrived.contains(&(*ttl, *np)));
 
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
 
-            for numprobe in didnt_arrive.iter() {
-                if let Some(id) = ids.get(&(ttl, *numprobe)) {
+            for (ttl, numprobe) in didnt_arrive.iter() {
+                if let Some(id) = ids.get(&(*ttl, *numprobe)) {
                     if tx1
                         .send(Message::Timeout(Payload {
                             id: *id,
@@ -125,9 +124,6 @@ pub async fn trace(
                 }
             }
         }
-
-        debug!("dropping the permit");
-        drop(permit);
     }
 
     info!("exiting");

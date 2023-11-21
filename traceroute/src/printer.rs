@@ -95,8 +95,7 @@ pub async fn print_results(
                 }
             }
 
-            let expected_numprobe = expected_numprobes.get(&final_hop).unwrap();
-            if last_printed != 0 && *expected_numprobe == 3 && last_printed == final_hop {
+            if last_printed != 0 && last_printed == final_hop {
                 info!("printed final_hop ({final_hop}), breaking");
                 break 'mainloop;
             }
@@ -135,7 +134,9 @@ fn print_probe(
                 print!("{}: ", hop);
                 print!("* ");
             }
+
             std::io::stdout().flush()?;
+
             *expected_numprobe += 1;
 
             return Ok(true);
@@ -152,7 +153,6 @@ fn print_probe(
         } else if payload.numprobe == 3 {
             if payload.rtt.is_some() {
                 println!("- {:?}", payload.rtt.unwrap());
-                info!("printer: added one more permit");
             } else {
                 println!("*");
             }
