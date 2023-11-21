@@ -25,7 +25,7 @@ pub async fn receive(
     tx1: Sender<Message>,
     mut rx2: Receiver<Message>,
 ) -> Result<()> {
-    info!("receiver: inside");
+    debug!("receiver: inside");
     let recv_sock = create_sock()?;
     let mut recv_buf = [0u8; 576];
     let mut recvd = HashSet::new();
@@ -33,12 +33,21 @@ pub async fn receive(
     let mut final_hop = 0;
 
     loop {
+        info!("looping");
         if let Ok(Message::BreakReceiver) = rx2.try_recv() {
-            info!("got BreakReceiver, closing the semaphore and breaking");
+            info!("got BreakReceiver, breaking");
             break;
         }
 
-        let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
+        let (_bytes_received, ip_addr) = match tokio::time::timeout(
+            tokio::time::Duration::from_millis(300),
+            recv_sock.recv_from(&mut recv_buf),
+        )
+        .await
+        {
+            Ok(result) => result.unwrap(),
+            Err(_) => continue,
+        };
 
         let time_recvd = Instant::now();
 
@@ -69,7 +78,7 @@ pub async fn receive(
             continue;
         }
 
-        let rtt = time_from_id(&timetable, time_recvd, id).await?;
+        let rtt = time_from_id(timetable.clone(), time_recvd, id)?;
 
         if let Entry::Vacant(e) = dns_cache.entry(ip_addr) {
             match reverse_dns_lookup(ip_addr).await {
@@ -79,7 +88,7 @@ pub async fn receive(
                 }
                 Err(err) => {
                     error!("error on reverse_dns_lookup ({err})");
-                    warn!("breaking printer and exiting");
+                    debug!("breaking printer and exiting");
                     tx1.send(Message::BreakPrinter).await?;
                     break;
                 }
@@ -121,6 +130,10 @@ pub async fn receive(
                     continue;
                 }
 
+                if hop < final_hop {
+                    final_hop = hop;
+                }
+
                 debug!("sending EchoReply for hop {hop}");
                 if tx1
                     .send(Message::EchoReply(Payload {
@@ -147,6 +160,10 @@ pub async fn receive(
                 if hop > final_hop {
                     warn!(hop, final_hop, "received hop > final_hop");
                     continue;
+                }
+
+                if hop < final_hop {
+                    final_hop = hop;
                 }
 
                 debug!("sending DestinationUnreachable for hop {hop}");

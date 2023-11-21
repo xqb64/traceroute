@@ -1,4 +1,4 @@
-use crate::internal::{Message, Payload};
+use crate::internal::{time_from_id, Message, Payload};
 use crate::net::{build_ipv4_packet, TracerouteProtocol, IPPROTO_RAW, IP_HDR_LEN};
 use anyhow::Result;
 use pnet::packet::Packet;
@@ -15,7 +15,7 @@ use tokio::{
     sync::{mpsc::Sender, Semaphore},
     time::Instant,
 };
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(
@@ -52,11 +52,11 @@ pub async fn trace(
 
         for numprobe in 1..=3 {
             if semaphore.is_closed() {
-                warn!("break because of the closed semaphore");
+                debug!("break because of the closed semaphore");
                 break;
             }
 
-            info!("probing ttl {ttl} for the {numprobe}. time",);
+            debug!("probing ttl {ttl} for the {numprobe}. time",);
             // println!("send_probe: ttl {} numprobe {}", ttl, numprobe + 1);
             let id = send_probe(
                 target,
@@ -68,60 +68,54 @@ pub async fn trace(
             )
             .await?;
 
-            ids.insert((ttl, numprobe), id);
+            ids.insert((ttl, numprobe), (id, false));
         }
 
         {
             debug!("checking if ttl {ttl} timed out");
 
-            let mut didnt_arrive = (1..=3).map(|n| (ttl, n)).collect::<Vec<_>>();
-            let mut arrived = vec![];
-
-            let check_started = tokio::time::Instant::now();
-
             loop {
-                if tokio::time::Instant::now().duration_since(check_started)
-                    >= tokio::time::Duration::from_secs(3)
-                    || semaphore.is_closed()
-                    || arrived.len() == 3
-                {
+                let responses = {
+                    let guard = { responses.lock().unwrap() };
+                    guard[ttl as usize - 1].clone()
+                };
+
+                if responses.iter().len() >= 3 {
+                    debug!("break because all arrived");
                     break;
                 }
 
-                for (ttl, numprobe) in didnt_arrive.iter() {
-                    let response = {
-                        let guard = { responses.lock().unwrap() };
-                        guard[*ttl as usize - 1].get(*numprobe - 1).cloned()
-                    };
-
-                    if response.is_some() {
-                        arrived.push((*ttl, *numprobe));
-                    }
+                if semaphore.is_closed() {
+                    debug!("break because semaphore is closed");
+                    break;
                 }
 
-                didnt_arrive.retain(|(ttl, np)| !arrived.contains(&(*ttl, *np)));
+                for ((_ttl, numprobe), (id, sent_timeout)) in ids.iter_mut() {
+                    if *sent_timeout {
+                        debug!("already sent timeout fot ttl {_ttl} numprobe {numprobe}");
+                        continue;
+                    }
+                    let now = tokio::time::Instant::now();
+                    let time_waiting = time_from_id(timetable.clone(), now, *id)?;
+                    if time_waiting >= tokio::time::Duration::from_secs(3) {
+                        if tx1
+                            .send(Message::Timeout(Payload {
+                                id: *id,
+                                numprobe: *numprobe,
+                                hostname: None,
+                                ip_addr: None,
+                                rtt: None,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            error!("sending Timeout to printer failed");
+                        }
+                        *sent_timeout = true;
+                    }
+                }
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-
-            for (ttl, numprobe) in didnt_arrive.iter() {
-                if let Some(id) = ids.get(&(*ttl, *numprobe)) {
-                    if tx1
-                        .send(Message::Timeout(Payload {
-                            id: *id,
-                            numprobe: *numprobe,
-                            hostname: None,
-                            ip_addr: None,
-                            rtt: None,
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        warn!("sending Timeout to printer failed");
-                    }
-                } else {
-                    break;
-                }
             }
         }
     }

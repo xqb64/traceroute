@@ -11,18 +11,14 @@ use traceroute::net::{to_ipaddr, TracerouteProtocol};
 use traceroute::printer::print_results;
 use traceroute::receiver::receive;
 use traceroute::tracer::trace;
-use tracing::info;
-use tracing_subscriber::{self, prelude::*};
+use tracing::{debug, info};
 
 const START_TTL: u8 = 0;
 const MAX_TASKS_IN_FLIGHT: usize = 8;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("error")
-        .finish()
-        .init();
+    tracing_subscriber::fmt::init();
 
     let opt = Opt::from_args();
     let result = run(&opt.target, &opt.protocol).await;
@@ -36,7 +32,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
     let target_ip = to_ipaddr(target).await?;
     let protocol = protocol.parse::<TracerouteProtocol>()?;
 
-    info!("traceroute for {target_ip} using {protocol:?}");
+    debug!("traceroute for {target_ip} using {protocol:?}");
 
     let semaphore = Arc::new(Semaphore::new(MAX_TASKS_IN_FLIGHT));
 
@@ -90,7 +86,7 @@ async fn run(target: &str, protocol: &str) -> Result<()> {
             ttl.clone(),
             timetable.clone(),
         )));
-        info!("tracer {n}: spawned");
+        debug!("tracer {n}: spawned");
     }
 
     for (n, task) in tasks.into_iter().enumerate() {

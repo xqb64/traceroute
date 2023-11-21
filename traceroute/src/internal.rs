@@ -43,8 +43,8 @@ pub fn numprobe_from_id(id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>, id: u16
     }
 }
 
-pub async fn time_from_id(
-    timetable: &Arc<Mutex<HashMap<u16, Instant>>>,
+pub fn time_from_id(
+    timetable: Arc<Mutex<HashMap<u16, Instant>>>,
     instant: Instant,
     id: u16,
 ) -> Result<Duration> {

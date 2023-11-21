@@ -14,7 +14,6 @@ use tracing::{debug, error, info, instrument};
 macro_rules! add_msg {
     ($id_table:expr, $hop:expr, $rguard:expr, $msg:expr) => {{
         $rguard[$hop as usize - 1].push($msg);
-        sort(&mut $rguard[$hop as usize - 1]);
     }};
 }
 
@@ -26,13 +25,13 @@ pub async fn print_results(
     tx2: Sender<Message>,
     semaphore: Arc<Semaphore>,
 ) -> Result<()> {
-    info!("printer: inside");
+    debug!("printer: inside");
     /* The printer awaits messages from the receiver. Sometimes, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
     let mut last_printed = 0;
     let mut final_hop = 0;
-    let mut expected_numprobes: HashMap<_, usize> = (0..255).map(|key| (key, 1)).collect();
+    let mut expected_numprobes: HashMap<_, usize> = (1..255).map(|key| (key, 1)).collect();
 
     'mainloop: while let Some(msg) = rx1.recv().await {
         let mut rguard = { responses.lock().unwrap() };
@@ -55,10 +54,8 @@ pub async fn print_results(
 
                 debug!("got {icmp_type} for hop {hop}");
 
-                if final_hop == 0 {
-                    final_hop = hop;
-                    info!("set final_hop to {final_hop}");
-                }
+                final_hop = hop;
+                info!("set final_hop to {final_hop}");
             }
             Message::Timeout(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
@@ -75,7 +72,15 @@ pub async fn print_results(
         }
 
         while last_printed < u8::MAX && !rguard[last_printed as usize].is_empty() {
-            if let Some(response) = rguard[last_printed as usize].pop() {
+            if let Some(response) = rguard[last_printed as usize].iter().find(|msg| match msg {
+                Message::TimeExceeded(payload)
+                | Message::DestinationUnreachable(payload)
+                | Message::EchoReply(payload)
+                | Message::Timeout(payload) => {
+                    payload.numprobe == *expected_numprobes.get(&(last_printed + 1)).unwrap()
+                }
+                _ => false,
+            }) {
                 match response.clone() {
                     Message::TimeExceeded(payload)
                     | Message::DestinationUnreachable(payload)
@@ -93,6 +98,8 @@ pub async fn print_results(
                     }
                     _ => {}
                 }
+            } else {
+                continue 'mainloop;
             }
 
             if last_printed != 0 && last_printed == final_hop {
@@ -162,24 +169,4 @@ fn print_probe(
         }
     }
     Ok(true)
-}
-
-fn sort(v: &mut [Message]) {
-    v.sort_by(|a, b| {
-        let numprobe_a = match a {
-            Message::TimeExceeded(payload)
-            | Message::DestinationUnreachable(payload)
-            | Message::EchoReply(payload) => payload.numprobe,
-            Message::Timeout(payload) => payload.numprobe,
-            _ => 0, // Handle non-Payload messages as needed
-        };
-        let numprobe_b = match b {
-            Message::TimeExceeded(payload)
-            | Message::DestinationUnreachable(payload)
-            | Message::EchoReply(payload) => payload.numprobe,
-            Message::Timeout(payload) => payload.numprobe,
-            _ => 0, // Handle non-Payload messages as needed
-        };
-        numprobe_b.cmp(&numprobe_a)
-    });
 }
