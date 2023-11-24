@@ -1,5 +1,11 @@
 [package]
 name = "traceroute"
+authors = ["xqb64 <x@nuked.one>"]
+description = "An asynchronous traceroute(1) implementation"
+readme = "README.md"
+repository = "https://github.com/xqb64/traceroute"
+license = "MIT"
+keywords = ["traceroute", "networking"]
 version = "0.1.0"
 edition = "2021"
 
