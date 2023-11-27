@@ -121,17 +121,13 @@ pub async fn receive(
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
                 let hop = hop_from_id(id_table.clone(), id)?;
 
-                if final_hop == 0 {
+                if final_hop == 0 || hop < final_hop {
                     error!("received EchoReply for {hop}");
                     final_hop = hop;
                 }
 
                 if hop > final_hop {
                     continue;
-                }
-
-                if hop < final_hop {
-                    final_hop = hop;
                 }
 
                 debug!("sending EchoReply for hop {hop}");
@@ -153,17 +149,13 @@ pub async fn receive(
                 let numprobe = numprobe_from_id(id_table.clone(), id)?;
                 let hop = hop_from_id(id_table.clone(), id)?;
 
-                if final_hop == 0 {
+                if final_hop == 0 || hop < final_hop {
                     final_hop = hop;
                 }
 
                 if hop > final_hop {
                     warn!(hop, final_hop, "received hop > final_hop");
                     continue;
-                }
-
-                if hop < final_hop {
-                    final_hop = hop;
                 }
 
                 debug!("sending DestinationUnreachable for hop {hop}");
