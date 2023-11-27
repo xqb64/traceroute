@@ -1,0 +1,54 @@
+name: Rust Checks
+
+on: [push, pull_request]
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    - run: rustup component add rustfmt
+    - uses: actions-rs/cargo@v1
+      with:
+        command: fmt
+        args: --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    - run: rustup component add clippy
+    - uses: actions-rs/cargo@v1
+      with:
+        command: clippy
+        args: -- -D warnings
+
+  udeps:
+    name: cargo udeps
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: nightly
+        override: true
+    - run: cargo install cargo-udeps --locked
+    - uses: actions-rs/cargo@v1
+      with:
+        command: udeps
