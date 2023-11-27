@@ -35,7 +35,7 @@ jobs:
     - uses: actions-rs/cargo@v1
       with:
         command: clippy
-        args: -- -D warnings
+        args: -p traceroute --no-deps -- -D warnings
 
   udeps:
     name: cargo udeps
