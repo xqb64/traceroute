@@ -33,7 +33,6 @@ pub async fn receive(
     let mut final_hop = 0;
 
     loop {
-        info!("looping");
         if let Ok(Message::BreakReceiver) = rx2.try_recv() {
             info!("got BreakReceiver, breaking");
             break;
