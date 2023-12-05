@@ -1,15 +1,14 @@
-use crate::net::{build_ipv4_packet, TracerouteProtocol, IPPROTO_RAW, IP_HDR_LEN};
+use crate::{
+    net::{build_ipv4_packet, TracerouteProtocol, IPPROTO_RAW, IP_HDR_LEN},
+    IdTable, TimeTable,
+};
 use anyhow::Result;
 use pnet::packet::Packet;
 use raw_socket::{
     tokio::prelude::{Level, Name, RawSocket},
     Domain, Protocol, Type,
 };
-use std::{
-    collections::{hash_map::Entry::Vacant, HashMap},
-    net::Ipv4Addr,
-    sync::{Arc, Mutex},
-};
+use std::{collections::hash_map::Entry::Vacant, net::Ipv4Addr};
 use tokio::time::Instant;
 use tracing::{instrument, warn};
 
@@ -18,9 +17,9 @@ pub async fn send_probe(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
     ttl: u8,
-    numprobe: usize,
-    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
-    timetable: Arc<Mutex<HashMap<u16, Instant>>>,
+    numprobe: u8,
+    id_table: IdTable,
+    timetable: TimeTable,
 ) -> Result<(u16, Instant)> {
     let sock = RawSocket::new(
         Domain::ipv4(),

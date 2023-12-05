@@ -1,4 +1,7 @@
-use crate::internal::{hop_from_id, Message, Payload};
+use crate::{
+    internal::{hop_from_id, Message, Payload},
+    IdTable,
+};
 use anyhow::Result;
 use std::{
     collections::HashMap,
@@ -17,7 +20,7 @@ macro_rules! add_msg {
 #[instrument(skip_all, name = "printer")]
 pub async fn print_results(
     responses: Arc<Mutex<[Vec<Message>; u8::MAX as usize]>>,
-    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
+    id_table: IdTable,
     mut rx1: Receiver<Message>,
     tx2: Sender<Message>,
 ) -> Result<()> {
@@ -27,7 +30,7 @@ pub async fn print_results(
      * the hops in ascending order. */
     let mut last_printed = 0;
     let mut final_hop = 0;
-    let mut expected_numprobes: HashMap<_, usize> = (1..255).map(|key| (key, 1)).collect();
+    let mut expected_numprobes: HashMap<_, u8> = (1..255).map(|key| (key, 1)).collect();
 
     'mainloop: while let Some(msg) = rx1.recv().await {
         let mut rguard = { responses.lock().unwrap() };
@@ -115,7 +118,7 @@ pub async fn print_results(
 fn print_probe(
     payload: &Payload,
     hop: u8,
-    expected_numprobe: &mut usize,
+    expected_numprobe: &mut u8,
     last_printed: &mut u8,
 ) -> Result<bool> {
     if hop == *last_printed + 1 && payload.numprobe == *expected_numprobe {

@@ -1,6 +1,6 @@
-use crate::error_and_bail;
 use crate::internal::{hop_from_id, numprobe_from_id, time_from_id, Message, Payload};
 use crate::net::{id_from_payload, reverse_dns_lookup, ICMP_HDR_LEN, IP_HDR_LEN};
+use crate::{error_and_bail, IdTable, TimeTable};
 use anyhow::{bail, Result};
 use pnet::packet::{
     icmp::{IcmpPacket, IcmpTypes},
@@ -9,11 +9,8 @@ use pnet::packet::{
 };
 use raw_socket::tokio::RawSocket;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
 use tokio::{sync::mpsc::Sender, time::Instant};
 use tracing::{debug, error, instrument, warn};
 
@@ -21,8 +18,8 @@ use tracing::{debug, error, instrument, warn};
 pub async fn recv(
     recv_sock: &mut RawSocket,
     mut recv_buf: [u8; 576],
-    id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
-    time_table: Arc<Mutex<HashMap<u16, Instant>>>,
+    id_table: IdTable,
+    time_table: TimeTable,
     dns_cache: &mut HashMap<SocketAddr, String>,
     tx1: Sender<Message>,
 ) -> Result<u16> {
