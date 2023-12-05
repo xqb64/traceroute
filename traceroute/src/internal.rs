@@ -14,8 +14,7 @@ pub enum Message {
     DestinationUnreachable(Payload),
     EchoReply(Payload),
     Timeout(Payload),
-    BreakReceiver,
-    BreakPrinter,
+    Quit,
 }
 
 #[derive(Debug, Clone, PartialEq)]

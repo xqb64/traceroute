@@ -5,11 +5,8 @@ use std::{
     io::Write,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{
-    mpsc::{Receiver, Sender},
-    Semaphore,
-};
-use tracing::{debug, error, info, instrument};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::{debug, info, instrument};
 
 macro_rules! add_msg {
     ($id_table:expr, $hop:expr, $rguard:expr, $msg:expr) => {{
@@ -23,7 +20,6 @@ pub async fn print_results(
     id_table: Arc<Mutex<HashMap<u16, (u8, usize)>>>,
     mut rx1: Receiver<Message>,
     tx2: Sender<Message>,
-    semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     debug!("printer: inside");
     /* The printer awaits messages from the receiver. Sometimes, the messages
@@ -54,7 +50,9 @@ pub async fn print_results(
 
                 debug!("got {icmp_type} for hop {hop}");
 
-                final_hop = hop;
+                if final_hop == 0 || hop < final_hop {
+                    final_hop = hop;
+                }
                 info!("set final_hop to {final_hop}");
             }
             Message::Timeout(payload) => {
@@ -63,10 +61,6 @@ pub async fn print_results(
 
                 let numprobe = payload.numprobe;
                 debug!("got Timeout for hop {hop} (numprobe {numprobe})");
-            }
-            Message::BreakPrinter => {
-                error!("received BreakPrinter, breaking");
-                break 'mainloop;
             }
             _ => {}
         }
@@ -109,11 +103,8 @@ pub async fn print_results(
         }
     }
 
-    if tx2.send(Message::BreakReceiver).await.is_ok() {
-        info!("sent BreakReceiver");
-
-        semaphore.close();
-        info!("closed the semaphore");
+    if tx2.send(Message::Quit).await.is_ok() {
+        info!("sent Quit");
     }
 
     info!("exiting");

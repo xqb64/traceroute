@@ -19,7 +19,6 @@ use std::{
     ffi::{CStr, CString},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
-    sync::Arc,
 };
 use tracing::error;
 
@@ -214,9 +213,9 @@ pub fn id_from_payload(payload: &[u8]) -> u16 {
     id
 }
 
-pub fn create_sock() -> Result<Arc<RawSocket>> {
+pub fn create_sock() -> Result<RawSocket> {
     match RawSocket::new(Domain::ipv4(), Type::raw(), Protocol::icmpv4().into()) {
-        Ok(sock) => Ok(Arc::new(sock)),
+        Ok(sock) => Ok(sock),
         Err(_) => error_and_bail!("couldn't create the socket"),
     }
 }
