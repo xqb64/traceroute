@@ -97,13 +97,27 @@ async fn run(
             }
 
             select! {
-                Ok(ident) = recv(&mut recv_sock, recv_buf, id_table.clone(), time_table.clone(), &mut dns_cache, tx1.clone()) => {
+                Ok(ident) = recv(
+                    &mut recv_sock,
+                    recv_buf,
+                    id_table.clone(),
+                    time_table.clone(),
+                    &mut dns_cache,
+                    tx1.clone(),
+                ) => {
                     v.retain(|probe| probe.id != ident);
                 }
                 _ = sleep_until(v[0].timeout) => {
                     let id = v[0].id;
                     let numprobe = numprobe_from_id(id_table.clone(), id)?;
-                    tx1.send(Message::Timeout(Payload { id, numprobe, hostname: None, ip_addr: None, rtt: None })).await?;
+                    tx1.send(Message::Timeout(Payload {
+                        id,
+                        numprobe,
+                        hostname: None,
+                        ip_addr: None,
+                        rtt: None,
+                    }))
+                    .await?;
                     v.pop_front();
                 },
             };
