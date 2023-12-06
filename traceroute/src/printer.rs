@@ -1,5 +1,5 @@
 use crate::{
-    internal::{hop_from_id, Message, Payload},
+    internal::{hop_from_id, numprobe_from_id, Message, Payload},
     IdTable,
 };
 use anyhow::Result;
@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 macro_rules! add_msg {
     ($id_table:expr, $hop:expr, $rguard:expr, $msg:expr) => {{
@@ -38,33 +38,29 @@ pub async fn print_results(
         match msg.clone() {
             Message::TimeExceeded(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
-                add_msg!(id_table, hop, rguard, msg);
+                add_msg!(id_table, hop, rguard, msg.clone());
 
-                debug!("got TimeExceeded for hop {hop}");
+                let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
+                debug!(hop, numprobe, "got message: {msg}");
             }
             Message::DestinationUnreachable(payload) | Message::EchoReply(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
                 add_msg!(id_table, hop, rguard, msg.clone());
 
-                let icmp_type = if let Message::DestinationUnreachable(_) = msg {
-                    "DestinationUnreachable"
-                } else {
-                    "EchoReply"
-                };
-
-                debug!("got {icmp_type} for hop {hop}");
+                let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
+                debug!(hop, numprobe, "got message: {msg}");
 
                 if final_hop == 0 || hop < final_hop {
                     final_hop = hop;
+                    info!(final_hop, "set final_hop");
                 }
-                info!("set final_hop to {final_hop}");
             }
             Message::Timeout(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
-                add_msg!(id_table, hop, rguard, msg);
+                add_msg!(id_table, hop, rguard, msg.clone());
 
-                let numprobe = payload.numprobe;
-                debug!("got Timeout for hop {hop} (numprobe {numprobe})");
+                let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
+                debug!(hop, numprobe, "got message: {msg}");
             }
             _ => {}
         }
@@ -106,14 +102,15 @@ pub async fn print_results(
             }
 
             if last_printed != 0 && last_printed == final_hop {
-                info!("printed final_hop ({final_hop}), breaking");
+                info!(final_hop, "printed final_hop, breaking");
                 break 'mainloop;
             }
         }
     }
 
-    if tx2.send(Message::Quit).await.is_ok() {
-        info!("sent Quit");
+    info!("sending Quit");
+    if tx2.send(Message::Quit).await.is_err() {
+        warn!("failed ot send Quit")
     }
 
     info!("exiting");
@@ -128,46 +125,46 @@ fn print_probe(
     last_printed: &mut u8,
     probes: u8,
 ) -> Result<bool> {
-    if hop == *last_printed + 1 && payload.numprobe == *expected_numprobe {
-        if payload.numprobe == 1 {
-            if payload.hostname.is_some() {
-                print!(
-                    "{}: {} ({}) - {:?} ",
-                    hop,
-                    payload.hostname.clone().unwrap(),
-                    payload.ip_addr.unwrap(),
-                    payload.rtt.unwrap()
-                );
-            } else {
-                print!("{}: ", hop);
-                print!("* ");
+    if hop != *last_printed + 1 || payload.numprobe != *expected_numprobe {
+        return Ok(true);
+    }
+
+    match payload.numprobe {
+        1 => {
+            match (&payload.hostname, payload.ip_addr, payload.rtt) {
+                (Some(hostname), Some(ip_addr), Some(rtt)) => {
+                    print!("{}: {} ({}) - {:?} ", hop, hostname, ip_addr, rtt);
+                }
+                _ => print!("{}: * ", hop),
             }
 
             std::io::stdout().flush()?;
 
             *expected_numprobe += 1;
 
-            return Ok(true);
-        } else if payload.numprobe > 1 && payload.numprobe < probes {
-            if payload.rtt.is_some() {
-                print!("- {:?} ", payload.rtt.unwrap());
-            } else {
-                print!("* ");
+            Ok(true)
+        }
+        probe if (1..probes).contains(&probe) => {
+            match payload.rtt {
+                Some(rtt) => print!("- {:?} ", rtt),
+                None => print!("* "),
             }
+
             std::io::stdout().flush()?;
             *expected_numprobe += 1;
 
-            return Ok(true);
-        } else if payload.numprobe == probes {
-            if payload.rtt.is_some() {
-                println!("- {:?}", payload.rtt.unwrap());
-            } else {
-                println!("*");
+            Ok(true)
+        }
+        _ if payload.numprobe == probes => {
+            match payload.rtt {
+                Some(rtt) => println!("- {:?} ", rtt),
+                None => println!("*"),
             }
+
             *last_printed += 1;
 
-            return Ok(false);
+            Ok(false)
         }
+        _ => Ok(true),
     }
-    Ok(true)
 }

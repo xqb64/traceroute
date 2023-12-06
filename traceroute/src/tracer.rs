@@ -10,7 +10,7 @@ use raw_socket::{
 };
 use std::{collections::hash_map::Entry::Vacant, net::Ipv4Addr};
 use tokio::time::Instant;
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 
 #[instrument(skip_all, name = "prober", fields(n = ttl))]
 pub async fn send_probe(
@@ -41,7 +41,7 @@ pub async fn send_probe(
                 e.insert((ttl, numprobe));
                 break;
             } else {
-                warn!("generated random id {id}, trying again");
+                warn!(id, "generated duplicate random id, trying again");
             }
         }
     }
@@ -60,9 +60,13 @@ pub async fn send_probe(
 
     sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &1i32)?;
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
+
     sock.send_to(ipv4_packet.packet(), (target, 33434)).await?;
 
-    timetable.lock().unwrap().insert(id, Instant::now());
+    let time_sent = Instant::now();
+    timetable.lock().unwrap().insert(id, time_sent);
 
-    Ok((id, Instant::now()))
+    info!(ttl, "sent probe");
+
+    Ok((id, time_sent))
 }

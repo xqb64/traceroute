@@ -76,8 +76,6 @@ async fn run(
                 )
                 .await?;
 
-                debug!(ttl, numprobe, "sent probe for ttl");
-
                 v.push_back(Probe {
                     ttl: *ttl,
                     timeout: time_sent + Duration::from_secs(timeout),

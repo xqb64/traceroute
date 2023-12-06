@@ -12,7 +12,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::{sync::mpsc::Sender, time::Instant};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[instrument(skip_all, name = "receiver")]
 pub async fn recv(
@@ -23,7 +23,7 @@ pub async fn recv(
     dns_cache: &mut HashMap<SocketAddr, String>,
     tx1: Sender<Message>,
 ) -> Result<u16> {
-    debug!("receiver: inside");
+    info!("inside");
     let mut final_hop = 0;
 
     let (_bytes_received, ip_addr) = recv_sock.recv_from(&mut recv_buf).await?;
@@ -58,7 +58,7 @@ pub async fn recv(
                 e.insert(host); // Insert the new host into the cache
             }
             Err(err) => {
-                error!("error on reverse_dns_lookup ({err})");
+                error!("errored out on reverse_dns_lookup: {err}");
             }
         }
     }
@@ -70,7 +70,7 @@ pub async fn recv(
             let numprobe = numprobe_from_id(id_table.clone(), id)?;
             let hop = hop_from_id(id_table.clone(), id)?;
 
-            debug!("sending TimeExceeded for hop {hop}");
+            info!(hop, "sending TimeExceeded");
             if tx1
                 .send(Message::TimeExceeded(Payload {
                     id,
@@ -82,6 +82,7 @@ pub async fn recv(
                 .await
                 .is_err()
             {
+                warn!(hop, id, "failed sending TimeExceeded");
                 return Ok(id);
             }
         }
@@ -90,7 +91,7 @@ pub async fn recv(
             let hop = hop_from_id(id_table.clone(), id)?;
 
             if final_hop == 0 || hop < final_hop {
-                error!("received EchoReply for {hop}");
+                debug!(hop, "received EchoReply, setting final_hop");
                 final_hop = hop;
             }
 
@@ -98,7 +99,7 @@ pub async fn recv(
                 warn!(hop, final_hop, "received hop > final_hop");
             }
 
-            debug!("sending EchoReply for hop {hop}");
+            info!(hop, "sending EchoReply");
             if tx1
                 .send(Message::EchoReply(Payload {
                     id,
@@ -110,6 +111,7 @@ pub async fn recv(
                 .await
                 .is_err()
             {
+                warn!(hop, id, "failed sending EchoReply");
                 return Ok(id);
             }
         }
@@ -118,6 +120,7 @@ pub async fn recv(
             let hop = hop_from_id(id_table.clone(), id)?;
 
             if final_hop == 0 || hop < final_hop {
+                debug!(hop, "received DestinationUnreachable, setting final_hop");
                 final_hop = hop;
             }
 
@@ -125,7 +128,7 @@ pub async fn recv(
                 warn!(hop, final_hop, "received hop > final_hop");
             }
 
-            debug!("sending DestinationUnreachable for hop {hop}");
+            info!(hop, "sending DestinationUnreachable");
             if tx1
                 .send(Message::DestinationUnreachable(Payload {
                     id,
@@ -137,11 +140,14 @@ pub async fn recv(
                 .await
                 .is_err()
             {
+                warn!(hop, id, "failed sending DestinationUnreachable");
                 return Ok(id);
             }
         }
         _ => {}
     }
+
+    info!("exiting");
 
     Ok(id)
 }
