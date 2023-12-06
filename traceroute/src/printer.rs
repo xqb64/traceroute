@@ -23,6 +23,7 @@ pub async fn print_results(
     id_table: IdTable,
     mut rx1: Receiver<Message>,
     tx2: Sender<Message>,
+    probes: u8,
 ) -> Result<()> {
     debug!("printer: inside");
     /* The printer awaits messages from the receiver. Sometimes, the messages
@@ -86,8 +87,13 @@ pub async fn print_results(
                         let hop = hop_from_id(id_table.clone(), payload.id)?;
                         let expected_numprobe = expected_numprobes.get_mut(&hop).unwrap();
 
-                        let should_continue =
-                            print_probe(&payload, hop, expected_numprobe, &mut last_printed);
+                        let should_continue = print_probe(
+                            &payload,
+                            hop,
+                            expected_numprobe,
+                            &mut last_printed,
+                            probes,
+                        );
 
                         if should_continue.is_ok_and(|r| r) {
                             continue 'mainloop;
@@ -120,6 +126,7 @@ fn print_probe(
     hop: u8,
     expected_numprobe: &mut u8,
     last_printed: &mut u8,
+    probes: u8,
 ) -> Result<bool> {
     if hop == *last_printed + 1 && payload.numprobe == *expected_numprobe {
         if payload.numprobe == 1 {
@@ -141,7 +148,7 @@ fn print_probe(
             *expected_numprobe += 1;
 
             return Ok(true);
-        } else if payload.numprobe > 1 && payload.numprobe < 3 {
+        } else if payload.numprobe > 1 && payload.numprobe < probes {
             if payload.rtt.is_some() {
                 print!("- {:?} ", payload.rtt.unwrap());
             } else {
@@ -151,7 +158,7 @@ fn print_probe(
             *expected_numprobe += 1;
 
             return Ok(true);
-        } else if payload.numprobe == 3 {
+        } else if payload.numprobe == probes {
             if payload.rtt.is_some() {
                 println!("- {:?}", payload.rtt.unwrap());
             } else {

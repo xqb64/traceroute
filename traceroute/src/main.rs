@@ -23,14 +23,20 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let opt = Opt::from_args();
-    let result = run(&opt.target, opt.protocol, opt.hops, opt.probes).await;
+    let result = run(&opt.target, opt.protocol, opt.hops, opt.probes, opt.timeout).await;
 
     if let Err(e) = result {
         eprintln!("traceroute: {}", e);
     }
 }
 
-async fn run(target: &str, protocol: TracerouteProtocol, hops: u8, probes: u8) -> Result<()> {
+async fn run(
+    target: &str,
+    protocol: TracerouteProtocol,
+    hops: u8,
+    probes: u8,
+    timeout: u64,
+) -> Result<()> {
     let target_ip = to_ipaddr(target).await?;
 
     debug!("traceroute for {target_ip} using {protocol:?}");
@@ -51,7 +57,7 @@ async fn run(target: &str, protocol: TracerouteProtocol, hops: u8, probes: u8) -
 
     let responses = Arc::new(Mutex::new(responses));
 
-    let printer = tokio::spawn(print_results(responses, id_table.clone(), rx1, tx2));
+    let printer = tokio::spawn(print_results(responses, id_table.clone(), rx1, tx2, probes));
 
     let mut recv_sock = create_sock()?;
     let recv_buf = [0u8; 576];
@@ -74,7 +80,7 @@ async fn run(target: &str, protocol: TracerouteProtocol, hops: u8, probes: u8) -
 
                 v.push_back(Probe {
                     ttl: *ttl,
-                    timeout: time_sent + Duration::from_secs(3),
+                    timeout: time_sent + Duration::from_secs(timeout),
                     id,
                 });
 
@@ -121,4 +127,7 @@ struct Opt {
 
     #[structopt[short = "P", long, default_value="3"]]
     probes: u8,
+
+    #[structopt[short, long, default_value="3"]]
+    timeout: u64,
 }
