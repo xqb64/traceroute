@@ -62,7 +62,7 @@ pub async fn send_probe(
     sock.set_sockopt(Level::IPV4, Name::IPV4_HDRINCL, &1i32)?;
     sock.set_sockopt(Level::IPV4, Name::IP_TTL, &i32::from(ttl))?;
 
-    sock.send_to(ipv4_packet.packet(), (target, 33434)).await?;
+    sock.send_to(ipv4_packet.packet(), (target, 0)).await?;
 
     let time_sent = Instant::now();
     timetable.lock().unwrap().insert(id, time_sent);
