@@ -88,6 +88,9 @@ async fn run(
         }
 
         loop {
+            /* if 'v' is empty, this means that there are no outstanding
+             * probes, which means we should break this loop and send the
+             * next batch */
             if v.is_empty() {
                 break;
             }
