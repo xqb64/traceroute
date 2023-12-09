@@ -196,6 +196,10 @@ pub fn build_udp_packet(buf: &mut [u8]) -> NextPacket {
     NextPacket::Udp(packet)
 }
 
+/// Tries to parse the 'target' string to an Ipv4Addr.
+/// If the string is not directly parseable, tries to
+/// resolve it via a DNS lookup. If that does not work
+/// out either, report error and bail out.
 pub async fn to_ipaddr(target: &str) -> Result<Ipv4Addr> {
     match target.parse::<Ipv4Addr>() {
         Ok(addr) => Ok(addr),
