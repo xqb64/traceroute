@@ -121,6 +121,7 @@ async fn run(
                 _ = sleep_until(v[0].timeout) => {
                     let id = v[0].id;
                     let numprobe = numprobe_from_id(id_table.clone(), id)?;
+
                     tx1.send(Message::Timeout(Payload {
                         id,
                         numprobe,
@@ -129,6 +130,7 @@ async fn run(
                         rtt: None,
                     }))
                     .await?;
+
                     v.pop_front();
                 },
             };
