@@ -170,12 +170,16 @@ pub fn build_icmp_packet(buf: &mut [u8], id: u16) -> NextPacket {
     use pnet::packet::icmp::checksum;
 
     let mut packet = MutableEchoRequestPacket::new(buf).unwrap();
-    let seq_no = rand::random::<u16>();
 
     packet.set_icmp_type(IcmpTypes::EchoRequest);
     packet.set_icmp_code(IcmpCode::new(0));
-    packet.set_sequence_number(seq_no);
+
+    /* a random seq_no is fine */
+    packet.set_sequence_number(rand::random::<u16>());
+
+    /* set the identifier to match up responses later on */
     packet.set_identifier(id);
+
     packet.set_checksum(checksum(&IcmpPacket::new(packet.packet()).unwrap()));
 
     NextPacket::Icmp(packet)

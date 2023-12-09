@@ -44,6 +44,7 @@ async fn run(
     let id_table = Arc::new(Mutex::new(HashMap::new()));
     let time_table = Arc::new(Mutex::new(HashMap::new()));
 
+    /* 'v' is a VecDeque of outstanding probes */
     let mut v = VecDeque::new();
 
     /* receiver2printer */
@@ -58,8 +59,10 @@ async fn run(
     let recv_buf = [0u8; 576];
     let mut dns_cache = HashMap::new();
 
+    /* slice the (1..=hops) range into 4-sized chunks */
     'mainloop: for batch in (1..=hops).collect::<Vec<u8>>().chunks(4) {
         for ttl in batch {
+            /* for each ttl, send a probe 'probes' times */
             for numprobe in 1..=probes {
                 let (id, time_sent) = send_probe(
                     target_ip,
@@ -71,15 +74,19 @@ async fn run(
                 )
                 .await?;
 
+                /* add the probe as outstanding
+                 * timeout is 'timeout' secs from the time it was sent. */
                 v.push_back(Probe {
                     ttl: *ttl,
                     timeout: time_sent + Duration::from_secs(timeout),
                     id,
                 });
 
+                /* sleep a little for good measure */
                 sleep(Duration::from_millis(10)).await;
             }
         }
+
         loop {
             if v.is_empty() {
                 break;
@@ -89,6 +96,13 @@ async fn run(
                 break 'mainloop;
             }
 
+            /* wait on recv and timeout concurrently.
+             *
+             * if the response does not arrive before the other branch
+             * wakes up from sleeping, we consider that the hop timed out
+             * and remove the first element from the 'v' VecDeque.
+             *
+             * if it, however, arrives, we delete that probe from 'v'. */
             select! {
                 Ok(ident) = recv(
                     &mut recv_sock,
