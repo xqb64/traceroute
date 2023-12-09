@@ -90,6 +90,10 @@ pub async fn recv(
             let numprobe = numprobe_from_id(id_table.clone(), id)?;
             let hop = hop_from_id(id_table.clone(), id)?;
 
+            /* We only want to set final_hop if it hasn't already been
+             * set, or if the current final_hop we have is greater than
+             * the one we just got. The latter could happen if the res-
+             * ponse for hop 'n' arrives before the true final hop (x < n). */
             if final_hop == 0 || hop < final_hop {
                 debug!(hop, "received EchoReply, setting final_hop");
                 final_hop = hop;
@@ -119,6 +123,10 @@ pub async fn recv(
             let numprobe = numprobe_from_id(id_table.clone(), id)?;
             let hop = hop_from_id(id_table.clone(), id)?;
 
+            /* We only want to set final_hop if it hasn't already been
+             * set, or if the current final_hop we have is greater than
+             * the one we just got. The latter could happen if the res-
+             * ponse for hop 'n' arrives before the true final hop (x < n). */
             if final_hop == 0 || hop < final_hop {
                 debug!(hop, "received DestinationUnreachable, setting final_hop");
                 final_hop = hop;
