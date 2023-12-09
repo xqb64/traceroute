@@ -31,8 +31,9 @@ pub async fn send_probe(
     let ip_next_hdr_len = protocol.get_next_header_length();
     let mut ip_next_hdr_buf = protocol.get_ipv4_next_header_buffer();
     let ip_next_hdr_protocol = protocol.get_next_header_protocol();
-    let mut id;
 
+    /* Generate random id while making sure it is not a duplicate. */
+    let mut id;
     {
         let mut guard = id_table.lock().unwrap();
         loop {

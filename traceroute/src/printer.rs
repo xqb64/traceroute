@@ -13,6 +13,9 @@ macro_rules! add_msg {
     }};
 }
 
+/// The printer awaits messages from the receiver. Sometimes, the messages
+/// arrive out of order. The printer's job is to sort that out and print the
+/// hops in ascending order.
 #[instrument(skip_all, name = "printer")]
 pub async fn print_results(
     id_table: IdTable,
@@ -21,9 +24,7 @@ pub async fn print_results(
     probes: u8,
 ) -> Result<()> {
     debug!("printer: inside");
-    /* The printer awaits messages from the receiver. Sometimes, the messages
-     * arrive out of order, so the printer's job is to sort that out and print
-     * the hops in ascending order. */
+
     let mut responses: [Vec<Message>; u8::MAX as usize] = std::iter::repeat(Vec::new())
         .take(u8::MAX as usize)
         .collect::<Vec<_>>()
@@ -50,6 +51,10 @@ pub async fn print_results(
                 let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
                 debug!(hop, numprobe, "got message: {msg}");
 
+                /* We only want to set final_hop if it hasn't already been
+                 * set, or if the current final_hop we have is greater than
+                 * the one we just got. The latter could happen if the res-
+                 * ponse for hop 'n' arrives before the true final hop (x < n). */
                 if final_hop == 0 || hop < final_hop {
                     final_hop = hop;
                     info!(final_hop, "set final_hop");
@@ -66,6 +71,8 @@ pub async fn print_results(
         }
 
         while last_printed < u8::MAX && !responses[last_printed as usize].is_empty() {
+            /* If there is some message with the next expected numprobe,
+             * print it out. */
             if let Some(response) = responses[last_printed as usize]
                 .iter()
                 .find(|msg| match msg {
@@ -101,9 +108,14 @@ pub async fn print_results(
                     _ => {}
                 }
             } else {
+                /* Message with the next expected numprobe not found,
+                 * continue receiving messages. */
                 continue 'mainloop;
             }
 
+            /* If the last printed hop was final_hop at the same time,
+             * break the printer mainloop, and jump to sending Message::Quit
+             * to the main thread. */
             if last_printed != 0 && last_printed == final_hop {
                 info!(final_hop, "printed final_hop, breaking");
                 break 'mainloop;
@@ -113,7 +125,7 @@ pub async fn print_results(
 
     info!("sending Quit");
     if tx2.send(Message::Quit).await.is_err() {
-        warn!("failed ot send Quit")
+        warn!("failed to send Message::Quit")
     }
 
     info!("exiting");
@@ -121,6 +133,9 @@ pub async fn print_results(
     Ok(())
 }
 
+/// Prints the probe provided it is the expected hop and expected numprobe.
+/// Returns true if the printer should continue its mainloop (and try to
+/// receive more messages).
 fn print_probe(
     payload: &Payload,
     hop: u8,
@@ -128,6 +143,7 @@ fn print_probe(
     last_printed: &mut u8,
     probes: u8,
 ) -> Result<bool> {
+    /* Check to see if this is the probe we should be printing. */
     if hop != *last_printed + 1 || payload.numprobe != *expected_numprobe {
         return Ok(true);
     }
@@ -166,6 +182,8 @@ fn print_probe(
 
             *last_printed += 1;
 
+            /* Last numprobe, return false and let the
+             * printer receive more messages. */
             Ok(false)
         }
         _ => Ok(true),
