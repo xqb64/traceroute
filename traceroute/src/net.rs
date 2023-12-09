@@ -154,8 +154,8 @@ pub fn build_ipv4_packet(
     packet.set_ttl(ttl);
     packet.set_header_length(5); /* n * 32 bits. */
 
-    /* We are setting the identification field to the TTL
-     * that we later use to map responses back to correct hops. */
+    /* We are setting the identification field to
+     * be able to match up responses later on. */
     packet.set_identification(id);
     packet.set_next_level_protocol(next_header);
     packet.set_destination(dest);
