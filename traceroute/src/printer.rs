@@ -3,23 +3,18 @@ use crate::{
     IdTable,
 };
 use anyhow::Result;
-use std::{
-    collections::HashMap,
-    io::Write,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, io::Write};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, instrument, warn};
 
 macro_rules! add_msg {
-    ($id_table:expr, $hop:expr, $rguard:expr, $msg:expr) => {{
-        $rguard[$hop as usize - 1].push($msg);
+    ($responses:expr, $hop:expr, $msg:expr) => {{
+        $responses[$hop as usize - 1].push($msg);
     }};
 }
 
 #[instrument(skip_all, name = "printer")]
 pub async fn print_results(
-    responses: Arc<Mutex<[Vec<Message>; u8::MAX as usize]>>,
     id_table: IdTable,
     mut rx1: Receiver<Message>,
     tx2: Sender<Message>,
@@ -29,23 +24,28 @@ pub async fn print_results(
     /* The printer awaits messages from the receiver. Sometimes, the messages
      * arrive out of order, so the printer's job is to sort that out and print
      * the hops in ascending order. */
+    let mut responses: [Vec<Message>; u8::MAX as usize] = std::iter::repeat(Vec::new())
+        .take(u8::MAX as usize)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
     let mut last_printed = 0;
     let mut final_hop = 0;
     let mut expected_numprobes: HashMap<_, u8> = (1..255).map(|key| (key, 1)).collect();
 
     'mainloop: while let Some(msg) = rx1.recv().await {
-        let mut rguard = { responses.lock().unwrap() };
         match msg.clone() {
             Message::TimeExceeded(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
-                add_msg!(id_table, hop, rguard, msg.clone());
+                add_msg!(responses, hop, msg.clone());
 
                 let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
                 debug!(hop, numprobe, "got message: {msg}");
             }
             Message::DestinationUnreachable(payload) | Message::EchoReply(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
-                add_msg!(id_table, hop, rguard, msg.clone());
+                add_msg!(responses, hop, msg.clone());
 
                 let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
                 debug!(hop, numprobe, "got message: {msg}");
@@ -57,7 +57,7 @@ pub async fn print_results(
             }
             Message::Timeout(payload) => {
                 let hop = hop_from_id(id_table.clone(), payload.id).unwrap();
-                add_msg!(id_table, hop, rguard, msg.clone());
+                add_msg!(responses, hop, msg.clone());
 
                 let numprobe = numprobe_from_id(id_table.clone(), payload.id)?;
                 debug!(hop, numprobe, "got message: {msg}");
@@ -65,16 +65,19 @@ pub async fn print_results(
             _ => {}
         }
 
-        while last_printed < u8::MAX && !rguard[last_printed as usize].is_empty() {
-            if let Some(response) = rguard[last_printed as usize].iter().find(|msg| match msg {
-                Message::TimeExceeded(payload)
-                | Message::DestinationUnreachable(payload)
-                | Message::EchoReply(payload)
-                | Message::Timeout(payload) => {
-                    payload.numprobe == *expected_numprobes.get(&(last_printed + 1)).unwrap()
-                }
-                _ => false,
-            }) {
+        while last_printed < u8::MAX && !responses[last_printed as usize].is_empty() {
+            if let Some(response) = responses[last_printed as usize]
+                .iter()
+                .find(|msg| match msg {
+                    Message::TimeExceeded(payload)
+                    | Message::DestinationUnreachable(payload)
+                    | Message::EchoReply(payload)
+                    | Message::Timeout(payload) => {
+                        payload.numprobe == *expected_numprobes.get(&(last_printed + 1)).unwrap()
+                    }
+                    _ => false,
+                })
+            {
                 match response.clone() {
                     Message::TimeExceeded(payload)
                     | Message::DestinationUnreachable(payload)

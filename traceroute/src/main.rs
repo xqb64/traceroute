@@ -49,15 +49,7 @@ async fn run(
     let (tx1, rx1) = channel(1024);
     let (tx2, mut rx2) = channel(1);
 
-    let responses: [Vec<Message>; u8::MAX as usize] = std::iter::repeat(Vec::new())
-        .take(u8::MAX as usize)
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-
-    let responses = Arc::new(Mutex::new(responses));
-
-    let printer = tokio::spawn(print_results(responses, id_table.clone(), rx1, tx2, probes));
+    let printer = tokio::spawn(print_results(id_table.clone(), rx1, tx2, probes));
 
     let mut recv_sock = create_sock()?;
     let recv_buf = [0u8; 576];
