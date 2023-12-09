@@ -36,6 +36,9 @@ pub async fn recv(
     };
 
     let id = if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply {
+        /* On EchoReply, we don't get back the original IPv4 packet.
+         * Instead, the response contains payload which in turns contains
+         * an identifier, the same one we used to sent the probe. */
         id_from_payload(icmp_packet.payload())
     } else {
         /* A part of the original IPv4 packet (header + at least first 8 bytes)
