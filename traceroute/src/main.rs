@@ -46,7 +46,10 @@ async fn run(
 
     let mut v = VecDeque::new();
 
+    /* receiver2printer */
     let (tx1, rx1) = channel(1024);
+
+    /* printer2mainloop */
     let (tx2, mut rx2) = channel(1);
 
     let printer = tokio::spawn(print_results(id_table.clone(), rx1, tx2, probes));
