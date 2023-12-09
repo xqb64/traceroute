@@ -15,7 +15,10 @@ use tracing::{info, instrument, warn};
 #[instrument(
     skip_all,
     name = "prober",
-    fields(n = ttl, numprobe = numprobe)
+    fields(
+        n = ttl,
+        numprobe = numprobe
+    )
 )]
 pub async fn send_probe(
     target: Ipv4Addr,
