@@ -103,7 +103,8 @@ async fn run(
              *
              * if the response does not arrive before the other branch
              * wakes up from sleeping, we consider that the hop timed out
-             * and remove the first element from the 'v' VecDeque.
+             * and remove the first element from the 'v' VecDeque (since this
+             * is the probe we're waiting on).
              *
              * if it, however, arrives, we delete that probe from 'v'. */
             select! {
