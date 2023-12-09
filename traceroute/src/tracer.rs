@@ -12,7 +12,11 @@ use std::{collections::hash_map::Entry::Vacant, net::Ipv4Addr};
 use tokio::time::Instant;
 use tracing::{info, instrument, warn};
 
-#[instrument(skip_all, name = "prober", fields(n = ttl))]
+#[instrument(
+    skip_all,
+    name = "prober",
+    fields(n = ttl, numprobe = numprobe)
+)]
 pub async fn send_probe(
     target: Ipv4Addr,
     protocol: TracerouteProtocol,
