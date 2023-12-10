@@ -70,6 +70,13 @@ Contributors to this project are very welcome. Fork the repository and submit a 
 
 There is a pre-commit hook in the hook folder that could be helpful during development.
 
+## References
+
+- https://datatracker.ietf.org/doc/html/rfc768
+- https://datatracker.ietf.org/doc/html/rfc791
+- https://datatracker.ietf.org/doc/html/rfc792
+- https://datatracker.ietf.org/doc/html/rfc9293
+
 ## Licensing
 
 Licensed under the [MIT License](https://opensource.org/licenses/MIT). For details, see [LICENSE](https://github.com/xqb64/traceroute/blob/master/LICENSE).
