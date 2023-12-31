@@ -1,5 +1,3 @@
-![traceroute](traceroute.png)
-
 <h1 align="center">
 traceroute
 </h1>
